@@ -358,6 +358,9 @@ def kpis(main, deferred, rules, specials, front_steps=None) -> dict:
     return {
         "订单总数": len(main) + len(deferred),
         "正常生产单数": len(main),
+        "主序列喷嘴未匹配单数": sum(x.get("_nozzle") == "未匹配" for x in main),
+        "主序列除鳞环未匹配单数": sum(x.get("_descale") == "未匹配" for x in main),
+        "主序列工模具待确认单数": sum(x.get("_tooling_status") == "规格待确认" for x in main),
         "暂缓/剔除单数": len(deferred),
         "正常生产吨位": round(sum(float(x.get("_plan_tons", 0) or 0) for x in main), 1),
         "暂缓吨位": round(sum(float(x.get("_plan_tons", 0) or 0) for x in deferred), 1),
@@ -407,6 +410,7 @@ def explain(main, deferred, contract) -> dict:
                 "前炉首支进炉": core.clock(x.get("_front_start")),
                 "回火首支进炉": core.clock(x.get("_temper_start")),
                 "喷嘴规格": core.text(x.get("_nozzle")), "除鳞环/挡水板规格": core.text(x.get("_descale")),
+                "工模具核对状态": x.get("_tooling_status"), "工模具匹配依据": x.get("_tooling_reason"),
                 "急催": core.text(x.get("_urgent")), "备注": core.text(x.get("_note")),
             }
     for x in deferred:
@@ -415,6 +419,8 @@ def explain(main, deferred, contract) -> dict:
                     "原因": core.text(x.get("_defer_reason", "不能接入当前集中生产路径")),
                     "前炉温度": x.get("_front"), "回火温度": x.get("_temper"),
                     "壁厚": x.get("_wall"), "数量": x.get("_qty"), "计划产量": x.get("_plan_tons"),
+                    "喷嘴规格": x.get("_nozzle"), "除鳞环规格": x.get("_descale"),
+                    "工模具核对状态": x.get("_tooling_status"), "工模具匹配依据": x.get("_tooling_reason"),
                     "急催": core.text(x.get("_urgent")), "备注": core.text(x.get("_note"))}
     return {"error": f"未找到订单:{contract}"}
 
@@ -517,6 +523,10 @@ class Schedule:
         self.main, self.deferred = main, deferred
         self.kpi = kpis(main, deferred, engine.rules, engine.specials, engine.front_steps)
         self.issues = validate(main, engine.rules, engine.specials, engine.front_steps)
+        self.tooling_issues = [{"类别": "工模具待确认", "任务ID": core.order_id(x), "订单编号": x["_contract"],
+                               "阶段": "主序列" if group is main else "暂缓", "问题": x.get("_tooling_reason", "")}
+                              for group in (main, deferred) for x in group if x.get("_tooling_status") == "规格待确认"]
+        self.issues.extend(self.tooling_issues)
 
     def export(self, path: Path) -> Path:
         if any(i["类别"] == "违规" for i in validate(self.main,self.engine.rules,self.engine.specials,self.engine.front_steps)):
@@ -548,6 +558,7 @@ class Engine:
         self.nozzles, self.descales = core.read_tooling(self.tooling_dir)
         self.loaded = True
         self.warnings = [] if self.nozzles and self.descales else ["未提供完整工模具规则，喷嘴/除鳞环可能未匹配"]
+        self.warnings.append("工模具规格匹配不代表库存可用；条件2档位及喷嘴选择待现场确认，未匹配明细见校验。当前文件不含挡水板及按工序适用规则。")
         self.warnings.append("时间轴沿用订单级节拍模型；全炉节拍联动、升降温曲线及输送容量未提供，需现场核验")
         return len(self.orders)
 

@@ -200,7 +200,8 @@ def state_payload() -> dict:
         c = sum(1 for i in cur.issues if i.get("类别") == "必要换规")
         return {
             "mode": "LLM" if API_KEY else "离线指令",
-            "version":agent.version,"warnings":engine.warnings,"diagnostics":engine.diagnostics,
+            "version":agent.version,"warnings":engine.warnings + [f"当前主序列有{cur.kpi['主序列工模具待确认单数']}条任务工模具规格待确认，需完成核对后安排现场生产。"],"diagnostics":engine.diagnostics,
+            "tooling_issues":cur.tooling_issues,
             "main": len(cur.main), "deferred": len(cur.deferred),
             "kpi": cur.kpi, "baseline_kpi": base.kpi,
             "diff": diff_kpis(base.kpi, cur.kpi),

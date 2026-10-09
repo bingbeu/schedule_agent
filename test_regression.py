@@ -119,6 +119,64 @@ class RulesAndData(unittest.TestCase):
         with self.assertRaises(ValueError):e.run({"start_delay_minutes":-60})
 
 
+class Tooling(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.nozzles, cls.descales = core.read_tooling(ROOT / "工模具")
+
+    def test_actual_workbook_and_provenance(self):
+        self.assertEqual((len(self.nozzles),len(self.descales)),(27,5))
+        self.assertEqual(core.tooling_formula("备用内径 = 外径 - 2 × 壁厚 - 20。"),(2,20))
+        self.assertEqual(self.nozzles[0]["来源"],"工模具.xlsx::喷嘴规格::2")
+        self.assertEqual(self.nozzles[0]["库存原值"],"")
+
+    def test_condition_one_with_cone(self):
+        name, reason = core.nozzle_match({"_outer":559,"_wall":20},self.nozzles)
+        self.assertEqual(name,"Φ485（Φ160）")
+        self.assertIn("条件1",reason)
+        self.assertIn("喷嘴规格::23",reason)
+
+    def test_no_unapproved_dimension_tolerance(self):
+        # 原0.1mm容差会错误放行355.6-2*23.83=307.94（上限306/下限308）。
+        self.assertEqual(core.nozzle_match({"_outer":355.6,"_wall":23.83},self.nozzles)[0],"未匹配")
+        self.assertEqual(core.nozzle_match({"_outer":355.6,"_wall":23.8},self.nozzles)[0],"Φ285（无分水锥）")
+
+    def test_condition_two_not_arbitrary_inner_filter(self):
+        # 备用367.34，外径档374增量6.66，但该档5种喷嘴无法唯一确定。
+        name,reason=core.nozzle_match({"_outer":406.4,"_wall":9.53},self.nozzles)
+        self.assertEqual(name,"未匹配")
+        for expected in ("6.66","Φ250","Φ345","选择待确认"):
+            self.assertIn(expected,reason)
+
+    def test_condition_two_increment_over_eight(self):
+        name,reason=core.nozzle_match({"_outer":406.4,"_wall":10.31},self.nozzles)
+        self.assertEqual(name,"未匹配")
+        self.assertIn("无外径档下限满足",reason)
+
+    def test_descale_exact_open_closed_boundaries(self):
+        for od,index in ((323.8,1),(408,1),(408.0001,2),(457.2,2),(457.2001,3),
+                         (510,3),(510.0001,4),(559,4),(559.0001,5),(610,5)):
+            self.assertTrue(core.descale_match({"_outer":od},self.descales).startswith(f"除鳞环{index}（"))
+        for od in (323,610.0001,None):
+            self.assertEqual(core.descale_match({"_outer":od},self.descales),"未匹配")
+
+    def test_overlapping_different_tools_rejected(self):
+        rules=copy.deepcopy(self.nozzles[:1]);r=copy.deepcopy(rules[0]);r["喷嘴"]="Φ999";rules.append(r)
+        self.assertEqual(core.nozzle_match({"_outer":323,"_wall":53},rules)[0],"未匹配")
+        rings=copy.deepcopy(self.descales[:1]);r=copy.deepcopy(rings[0]);r["规格"]="其他除鳞环";rings.append(r)
+        self.assertEqual(core.descale_match({"_outer":350},rings),"未匹配")
+
+    def test_real_coverage_is_separate_from_sequence_feasibility(self):
+        for source,all_nozzle,all_ring,main_pending in ((APRIL,95,105,12),(JUNE,36,43,5)):
+            e=Engine(source);m,d=e.run();s=Schedule(e,m,d)
+            self.assertEqual(sum(x["_nozzle"]!="未匹配" for x in m+d),all_nozzle)
+            self.assertEqual(sum(x["_descale"]!="未匹配" for x in m+d),all_ring)
+            self.assertEqual(s.kpi["主序列工模具待确认单数"],main_pending)
+            self.assertEqual(s.kpi["硬约束违规数"],0)
+            self.assertTrue(s.tooling_issues)
+            self.assertEqual(core.overview_row(m[0])["工模具核对状态"],m[0]["_tooling_status"])
+
+
 class Actions(unittest.TestCase):
     def setUp(self):
         self.agent=SchedulerAgent(SmallEngine())

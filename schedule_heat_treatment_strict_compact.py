@@ -30,7 +30,7 @@ SMALL_PLATFORM_MAX_ORDERS = 1
 HEADER_SCAN_ROWS = 40
 STEP_UNIT_MIN = 1 / 60
 TIGHT_TEMP = 5
-TOOL_TOL = 0.1
+TOOL_TOL = 1e-9  # 只消除浮点误差；现场表未授权0.1mm尺寸容差
 THICK_WALL_FALLBACK_MIN = 45
 FRONT_STEPS, TEMPER_STEPS = 42, 70
 
@@ -76,7 +76,7 @@ ALIASES = {
 BASE_COLS = [
     "序号", "阶段", "任务ID", "订单编号", "主体厂", "品种", "外径", "长度范围", "热处理方式", "计划产量",
     "牌号", "钢级", "壁厚", "数量", "步进周期", "布料方式", "前炉温度", "回火温度",
-    "喷嘴规格", "除鳞环/挡水板规格", "前炉首支进炉", "前炉末支进炉", "前炉末支出炉",
+    "喷嘴规格", "除鳞环/挡水板规格", "工模具核对状态", "前炉首支进炉", "前炉末支进炉", "前炉末支出炉",
     "回火首支进炉", "回火末支进炉", "回火末支出炉", "状态", "本单开始原因", "是否拥堵",
     "备注", "急催", "急催备注",
 ]
@@ -758,8 +758,9 @@ def tooling_formula(text_block: str):
 
 
 def read_tooling(path: Path) -> tuple[list[dict], list[dict]]:
-    """读取喷嘴和除鳞环规则。"""
+    """读取真实规格及来源；空库存不解释为0或不可用。"""
     nozzles, descales = [], []
+    headers = ("管坯外径(mm)", "管坯内径(mm)", "喷嘴内径d(mm)", "分水锥直径e(mm)")
     for file in files_from(path):
         with pd.ExcelFile(file) as xls:
             for sheet in xls.sheet_names:
@@ -767,87 +768,89 @@ def read_tooling(path: Path) -> tuple[list[dict], list[dict]]:
                 full = "\n".join(text(v) for v in df.to_numpy().ravel())
                 coef, offset = tooling_formula(full)
                 for i, row in df.iterrows():
-                    vals = [text(v) for v in row.tolist()]
-                    if "管坯外径 (mm)" in vals and "喷嘴内径 d (mm)" in vals:
-                        od, inn = vals.index("管坯外径 (mm)"), vals.index("管坯内径 (mm)")
-                        nz, cone = vals.index("喷嘴内径 d (mm)"), vals.index("分水锥直径 e (mm)")
-                        for _, r in df.iloc[i + 1:].iterrows():
-                            if parse_range(r.iloc[od]) and text(r.iloc[nz]):
-                                nozzles.append({
-                                    "外径": parse_range(r.iloc[od]), "内径": parse_range(r.iloc[inn]),
-                                    "喷嘴": text(r.iloc[nz]), "分水锥": text(r.iloc[cone]),
-                                    "条件2系数": coef, "条件2扣减": offset,
-                                })
-                for m in re.finditer(r"(\d+)\.?\s*(\d+(?:\.\d+)?)\s*([≤＜<])\s*[φΦ]\s*([≤＜<])\s*(\d+(?:\.\d+)?)", full):
+                    vals = [norm(text(v)).replace("（", "(").replace("）", ")") for v in row.tolist()]
+                    if all(h in vals for h in headers):
+                        od, inn, nz, cone = (vals.index(h) for h in headers)
+                        stock = vals.index("数量") if "数量" in vals else None
+                        for j, r in df.iloc[i + 1:].iterrows():
+                            if not text(r.iloc[od]):
+                                continue
+                            outer, inner = parse_range(r.iloc[od]), parse_range(r.iloc[inn])
+                            nozzle, cone_text = text(r.iloc[nz]), text(r.iloc[cone])
+                            source = f"{file.name}::{sheet}::{j + 1}"
+                            if not outer or not inner or not nozzle or not cone_text:
+                                raise RuleError(f"工模具规则字段不完整:{source}")
+                            nozzles.append({
+                                "外径": outer, "内径": inner, "喷嘴": nozzle, "分水锥": cone_text,
+                                "条件2系数": coef, "条件2扣减": offset,
+                                "来源": source, "库存原值": text(r.iloc[stock]) if stock is not None else "",
+                            })
+                for m in re.finditer(r"(\d+)\.\s*(\d+(?:\.\d+)?)\s*([≤＜<])\s*[φΦ]\s*([≤＜<])\s*(\d+(?:\.\d+)?)", full):
                     idx, lo, lop, hop, hi = m.groups()
-                    descales.append({"规格": f"除鳞环{idx}（{lo}{lop}φ{hop}{hi}）", "下": float(lo), "上": float(hi), "左闭": lop == "≤", "右闭": hop == "≤"})
+                    if float(lo) >= float(hi):
+                        raise RuleError(f"除鳞环范围错误:{file.name}::{sheet}::{idx}")
+                    descales.append({"规格": f"除鳞环{idx}（{lo}{lop}φ{hop}{hi}）", "下": float(lo), "上": float(hi),
+                                     "左闭": lop == "≤", "右闭": hop == "≤", "来源": f"{file.name}::{sheet}::条款{idx}"})
     return nozzles, descales
 
 
-def best_nozzle(rows):
-    """在命中喷嘴规则中选择范围最窄的一条。"""
-    return min(rows, key=lambda z: z["内径"][1] - z["内径"][0])
+def _tool_description(r):
+    return f"{r['喷嘴']}（{r['分水锥']}）"
+
+
+def _unique_nozzle(rows, explanation):
+    """多种不同工具不能用最窄范围或表格顺序擅自裁决。"""
+    choices = sorted({_tool_description(r) for r in rows})
+    sources = "、".join(r.get("来源", "未标注来源") for r in rows)
+    if len(choices) != 1:
+        return "未匹配", explanation + "；喷嘴/分水锥选择待确认，候选:" + "、".join(choices) + "；来源:" + sources
+    return choices[0], explanation + "；来源:" + sources
 
 
 def nozzle_match(x, rules) -> tuple[str, str]:
-    outer = x["_outer"]
-    wall = x["_wall"]
-    if outer is None or wall is None:
-        return "未匹配", "外径或壁厚缺失"
-
+    outer, wall = x.get("_outer"), x.get("_wall")
+    if (outer is None or wall is None or not math.isfinite(outer) or not math.isfinite(wall)
+            or outer <= 0 or wall <= 0 or outer <= 2 * wall):
+        return "未匹配", "外径/壁厚缺失或不满足正内径"
+    if not rules:
+        return "未匹配", "未提供喷嘴规则"
     inner = outer - 2 * wall
-    reason = ""
-
-    # ---------- 条件1（优先匹配） ----------
-    same_od = [r for r in rules if in_range(outer, r["外径"])]
-    exact = [r for r in same_od if in_range(inner, r["内径"])]
-
+    exact = [r for r in rules if in_range(outer, r["外径"]) and in_range(inner, r["内径"])]
     if exact:
-        r = best_nozzle(exact)
-        cone = f"（{r['分水锥']}）" if r.get("分水锥") and r["分水锥"] != "无分水锥" else "（无分水锥）"
-        return f"{r['喷嘴']}{cone}", ""
+        return _unique_nozzle(exact, f"喷嘴条件1：内径{inner:g}mm")
 
-    # ---------- 条件2（降级匹配） ----------
-    # 1. 提取公式系数（从任何规则中获取，所有规则共享同一个公式）
-    formula = next(((r.get("条件2系数"), r.get("条件2扣减")) for r in rules if r.get("条件2系数") and r.get("条件2扣减") is not None), None)
-    if not formula:
-        return "未匹配", "未找到条件2公式（备用内径计算式）"
-
-    coef, offset = formula
-    spare_inner = outer - coef * wall - offset
-
-    # 2. 在所有规则中，找到内径范围包含 spare_inner 的规则
-    inner_hits = [r for r in rules if in_range(spare_inner, r["内径"])]
-    if not inner_hits:
-        return "未匹配", f"备用内径 {spare_inner:.1f} 不在任何管坯内径范围内"
-    candidates = []
-    for r in inner_hits:
-        lo, hi = r["外径"]
-        if lo >= spare_inner - TOOL_TOL:  # 外径下限 >= 备用内径（容差）
-            diff = lo - spare_inner
-            if diff <= 8 + TOOL_TOL:
-                candidates.append((diff, r))
+    formulas = {(r.get("条件2系数"), r.get("条件2扣减")) for r in rules}
+    if len(formulas) != 1 or any(v is None for v in next(iter(formulas))):
+        return "未匹配", "条件2备用内径公式缺失或不一致"
+    coef, offset = next(iter(formulas))
+    spare = outer - coef * wall - offset
+    if spare <= 0:
+        return "未匹配", f"备用内径{spare:g}mm不为正数"
+    # 表中外径为范围：暂用外径档下限作为候选值，不额外添加内径过滤。
+    # 原说明未指定档内喷嘴选择，多个不同工具一律待确认。
+    candidates = [r for r in rules if -TOOL_TOL <= r["外径"][0] - spare <= 8 + TOOL_TOL]
     if not candidates:
-        return "未匹配", f"备用内径 {spare_inner:.1f} 找不到增量≤8的管坯外径规格"
+        return "未匹配", f"备用内径{spare:g}mm无外径档下限满足向上增量≤8mm（档位解释待现场确认）"
+    lower = min(r["外径"][0] for r in candidates)
+    selected = [r for r in candidates if r["外径"][0] == lower]
+    explanation = f"喷嘴条件2：备用内径{spare:g}mm，候选外径档下限{lower:g}mm，增量{lower-spare:g}mm（档位解释待现场确认）"
+    # 外径档的代表值本身尚未获现场确认，即使工具唯一也不能自动放行。
+    choice, reason = _unique_nozzle(selected, explanation)
+    return "未匹配", reason if choice == "未匹配" else reason + f"；候选:{choice}，条件2需现场确认"
 
-    # 取增量最小的那个（即最接近且大于等于备用内径）
-    diff, r = min(candidates, key=lambda x: x[0])
-    lo = r["外径"][0]
-    reason = f"喷嘴条件2匹配：外径{outer:g}不在管坯外径范围（或内径不匹配），备用内径{spare_inner:.1f}，选用外径下限{lo:.1f}，增量{diff:.1f}"
-    cone = f"（{r['分水锥']}）" if r.get("分水锥") and r["分水锥"] != "无分水锥" else "（无分水锥）"
-    return f"{r['喷嘴']}{cone}", reason
 
 def descale_match(x, rules) -> str:
     """按外径匹配除鳞环。"""
     outer = x["_outer"]
+    hits = []
     for r in rules:
         if outer is None:
             continue
         left = outer >= r["下"] if r["左闭"] else outer > r["下"]
         right = outer <= r["上"] if r["右闭"] else outer < r["上"]
         if left and right:
-            return r["规格"]
-    return "未匹配"
+            hits.append(r["规格"])
+    return hits[0] if len(set(hits)) == 1 else "未匹配"
 
 
 def apply_tooling(rows, nozzles, descales):
@@ -855,6 +858,10 @@ def apply_tooling(rows, nozzles, descales):
     for x in rows:
         nz, note = nozzle_match(x, nozzles)
         x["_nozzle"], x["_descale"] = nz, descale_match(x, descales)
+        if x["_descale"] == "未匹配":
+            note = append_note(note, "除鳞环未匹配：外径不在唯一有效区间或规则缺失")
+        x["_tooling_reason"] = note
+        x["_tooling_status"] = "规格待确认" if nz == "未匹配" or x["_descale"] == "未匹配" else "规格匹配，库存待核实"
         if note:
             x["_note"] = append_note(x.get("_note", ""), note)
 
@@ -868,7 +875,7 @@ def overview_row(x, seq=None, deferred=False):
             "品种": x.get("_variety", ""), "外径": x["_outer"], "长度范围": x.get("_length", ""), "热处理方式": x["_process"],
             "计划产量": x.get("_plan_qty", ""), "牌号": x.get("_brand", ""), "钢级": x.get("_steel", ""), "壁厚": x["_wall"],
             "数量": x["_qty"], "步进周期": x["_speed"], "布料方式": x["_loading"], "前炉温度": x.get("_front", ""),
-            "回火温度": x.get("_temper", ""), "喷嘴规格": x.get("_nozzle", ""), "除鳞环/挡水板规格": x.get("_descale", ""),
+            "回火温度": x.get("_temper", ""), "喷嘴规格": x.get("_nozzle", ""), "除鳞环/挡水板规格": x.get("_descale", ""), "工模具核对状态": x.get("_tooling_status", "规格待确认"),
             "状态": append_note(text(x.get("_status")), "暂缓/剔除主序列"), "本单开始原因": reason,
             "是否拥堵": "未排", "备注": append_note(x.get("_note", ""), reason), "急催": x.get("_urgent", ""), "急催备注": "",
         }
@@ -877,7 +884,7 @@ def overview_row(x, seq=None, deferred=False):
         "品种": x.get("_variety", ""), "外径": x["_outer"], "长度范围": x.get("_length", ""), "热处理方式": x["_process"],
         "计划产量": x.get("_plan_qty", ""), "牌号": x.get("_brand", ""), "钢级": x.get("_steel", ""), "壁厚": x["_wall"],
         "数量": x["_qty"], "步进周期": x["_speed"], "布料方式": x["_loading"], "前炉温度": x.get("_front", ""),
-        "回火温度": x.get("_temper", ""), "喷嘴规格": x.get("_nozzle", ""), "除鳞环/挡水板规格": x.get("_descale", ""),
+        "回火温度": x.get("_temper", ""), "喷嘴规格": x.get("_nozzle", ""), "除鳞环/挡水板规格": x.get("_descale", ""), "工模具核对状态": x.get("_tooling_status", "规格待确认"),
         "前炉首支进炉": clock(x.get("_front_start")), "前炉末支进炉": clock(x.get("_front_last_in")), "前炉末支出炉": clock(x.get("_front_end")),
         "回火首支进炉": clock(x.get("_temper_start")), "回火末支进炉": clock(x.get("_temper_last_in")), "回火末支出炉": clock(x.get("_temper_end")),
         "状态": x.get("_status", ""), "本单开始原因": x.get("_start_reason", "连续接料，无额外空炉"),
@@ -939,13 +946,13 @@ def write_excel(path, main, deferred, source_headers):
         overview += [None, None, "以下订单与此次排程不能集中生产/排产"]
         overview += [overview_row(x, len(main) + i + 1, True) for i, x in enumerate(deferred)]
     write_sheet(wb, "排产总览", overview, BASE_COLS)
-    source_cols = ["排产序号", "阶段", "任务ID", "订单编号", "本单开始原因", "状态", "喷嘴规格", "除鳞环/挡水板规格"] + source_headers
+    source_cols = ["排产序号", "阶段", "任务ID", "订单编号", "本单开始原因", "状态", "喷嘴规格", "除鳞环/挡水板规格", "工模具核对状态"] + source_headers
     source_rows = []
     for x in main + deferred:
         row = {
             "排产序号": x.get("_seq", ""), "阶段": "正常生产" if not x.get("_defer_reason") else "暂缓/剔除主序列",
             "任务ID":order_id(x), "订单编号": x["_contract"], "本单开始原因": x.get("_defer_reason") or x.get("_start_reason", ""),
-            "状态": x.get("_status", ""), "喷嘴规格": x.get("_nozzle", ""), "除鳞环/挡水板规格": x.get("_descale", ""),
+            "状态": x.get("_status", ""), "喷嘴规格": x.get("_nozzle", ""), "除鳞环/挡水板规格": x.get("_descale", ""), "工模具核对状态": x.get("_tooling_status", "规格待确认"),
         }
         row.update({h: x.get(h, "") for h in source_headers})
         source_rows.append(row)

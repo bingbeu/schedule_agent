@@ -142,6 +142,7 @@ class SchedulerAgent:
     def validate(self):
         v,c = _issue_counts(self.current)
         return {"硬约束违规数":v,"必要换规边数":c,"明细":self.current.issues,
+                "工模具待确认明细":self.current.tooling_issues,
                 "模型限制":self.engine.warnings,"后处理记录":self.engine.diagnostics}
 
     def compare(self):
