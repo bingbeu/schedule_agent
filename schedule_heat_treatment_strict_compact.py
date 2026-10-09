@@ -2,6 +2,9 @@
 from __future__ import annotations
 
 import argparse
+import math
+import os
+from functools import lru_cache
 import re
 from pathlib import Path
 
@@ -9,10 +12,13 @@ import pandas as pd
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
-from ortools.constraint_solver import pywrapcp, routing_enums_pb2
+try:
+    from ortools.constraint_solver import pywrapcp, routing_enums_pb2
+except ImportError:
+    pywrapcp = routing_enums_pb2 = None
 
 
-PROJECT = Path(r"C:\Users\mblon\Desktop\project")
+PROJECT = Path(os.environ.get("SCHEDULE_PROJECT_DIR", Path(__file__).resolve().parent))
 DEFAULT_INPUT = PROJECT / "data"
 DEFAULT_RULE = PROJECT / "rule"
 DEFAULT_TOOLING = PROJECT / "工模具"
@@ -26,6 +32,26 @@ STEP_UNIT_MIN = 1 / 60
 TIGHT_TEMP = 5
 TOOL_TOL = 0.1
 THICK_WALL_FALLBACK_MIN = 45
+FRONT_STEPS, TEMPER_STEPS = 42, 70
+
+
+class RuleError(ValueError):
+    """缺失或无法解释的工艺规则，不允许自动默认为零空格。"""
+
+
+def order_id(x):
+    return x.get("_uid", norm(x["_contract"]))
+
+
+def numeric_cell(value, label):
+    """严格读取一个数，拒绝多温度、范围及非有限数。"""
+    s = text(value).replace("℃", "").strip()
+    if not re.fullmatch(r"[+-]?\d+(?:\.\d+)?", s):
+        raise ValueError(f"{label}需为单一数值，原值={s!r}")
+    n = float(s)
+    if not math.isfinite(n):
+        raise ValueError(f"{label}必须为有限数")
+    return n
 
 ALIASES = {
     "contract": ("合同号", "合同编号", "订单编号", "任务单号", "销售订单"),
@@ -48,7 +74,7 @@ ALIASES = {
 }
 
 BASE_COLS = [
-    "序号", "阶段", "订单编号", "主体厂", "品种", "外径", "长度范围", "热处理方式", "计划产量",
+    "序号", "阶段", "任务ID", "订单编号", "主体厂", "品种", "外径", "长度范围", "热处理方式", "计划产量",
     "牌号", "钢级", "壁厚", "数量", "步进周期", "布料方式", "前炉温度", "回火温度",
     "喷嘴规格", "除鳞环/挡水板规格", "前炉首支进炉", "前炉末支进炉", "前炉末支出炉",
     "回火首支进炉", "回火末支进炉", "回火末支出炉", "状态", "本单开始原因", "是否拥堵",
@@ -133,6 +159,9 @@ def detect_header(df) -> tuple[int, list[str]]:
 def col_by_alias(headers, key):
     """按别名找到列名。"""
     for h in headers:
+        if norm(h).lower() in {norm(a).lower() for a in ALIASES[key]}:
+            return h
+    for h in headers:
         hn = norm(h).lower()
         if any(norm(a).lower() in hn for a in ALIASES[key]):
             return h
@@ -143,51 +172,88 @@ def read_inputs(path: Path) -> tuple[list[dict], list[str]]:
     """读取多个排产 Excel，并保留原始字段。"""
     rows, source_headers = [], []
     for file in files_from(path):
-        xls = pd.ExcelFile(file)
-        for sheet in xls.sheet_names:
-            raw = pd.read_excel(xls, sheet_name=sheet, header=None, dtype=object)
-            try:
-                hrow, headers = detect_header(raw)
-            except Exception:
-                continue
-            df = raw.iloc[hrow + 1:].copy()
-            df.columns = headers[:len(df.columns)]
-            source_headers.extend([h for h in headers if h not in source_headers])
-            cmap = {k: col_by_alias(df.columns, k) for k in ALIASES}
-            for ridx, r in df.iterrows():
-                contract = text(r.get(cmap["contract"])) if cmap["contract"] else ""
-                proc = text(r.get(cmap["process"])) if cmap["process"] else ""
-                if not contract and not proc:
+        with pd.ExcelFile(file) as xls:
+            for sheet in xls.sheet_names:
+                raw = pd.read_excel(xls, sheet_name=sheet, header=None, dtype=object)
+                try:
+                    hrow, headers = detect_header(raw)
+                except Exception:
                     continue
-                order = {h: r.get(h, "") for h in df.columns}
-                for k, c in cmap.items():
-                    order[f"_{k}"] = r.get(c) if c else ""
-                order["_contract"] = contract
-                order["_process"] = proc
-                order["_front"] = num(order["_front"])
-                order["_temper"] = num(order["_temper"])
-                order["_outer"] = num(order["_outer"])
-                order["_wall"] = num(order["_wall"])
-                order["_qty"] = int(round(num(order["_qty"], None) or num(order.get("_plan_qty"), 0) or 0))
-                order["_plan_tons"] = num(order.get("_plan_qty"), 0) or 0
-                order["_speed"] = num(order["_speed"])
-                order["_needs_temper"] = "回火" in proc
-                order["_needs_front"] = any(k in proc for k in ("正火", "淬火", "调质")) and not (proc.strip() == "回火返工")
-                order["_loading"] = "间隔布料" if "间隔" in text(order["_loading"]) else "连续布料"
-                order["_note"] = "" if cmap["loading"] else "未提供布料方式，默认连续"
-                order["_source_file"] = file.name
-                order["_source_sheet"] = sheet
-                missing = []
-                for label, key in [("订单编号", "_contract"), ("热处理方式", "_process"), ("计划支数", "_qty"), ("步进周期", "_speed"), ("壁厚", "_wall")]:
-                    if is_blank(order.get(key)) or order.get(key) == 0:
-                        missing.append(label)
-                if order["_needs_front"] and order["_front"] is None:
-                    missing.append("前炉温度")
-                if order["_needs_temper"] and order["_temper"] is None:
-                    missing.append("回火温度")
-                if missing:
-                    raise ValueError(f"{file.name}/{sheet}/Excel行{ridx+1} 订单{contract or '(空)'} 缺少：{','.join(missing)}")
-                rows.append(order)
+                df = raw.iloc[hrow + 1:].copy()
+                df.columns = headers[:len(df.columns)]
+                source_headers.extend([h for h in headers if h not in source_headers])
+                cmap = {k: col_by_alias(df.columns, k) for k in ALIASES}
+                for ridx, r in df.iterrows():
+                    contract = text(r.get(cmap["contract"])) if cmap["contract"] else ""
+                    proc = text(r.get(cmap["process"])) if cmap["process"] else ""
+                    if not contract and not proc:
+                        continue
+                    order = {h: r.get(h, "") for h in df.columns}
+                    for k, c in cmap.items():
+                        order[f"_{k}"] = r.get(c) if c else ""
+                    order["_contract"] = contract
+                    order["_process"] = proc
+                    order["_front"] = num(order["_front"])
+                    order["_temper"] = num(order["_temper"])
+                    order["_outer"] = num(order["_outer"])
+                    order["_wall"] = num(order["_wall"])
+                    order["_qty"] = int(round(num(order["_qty"], None) or num(order.get("_plan_qty"), 0) or 0))
+                    order["_plan_tons"] = num(order.get("_plan_qty"), 0) or 0
+                    order["_speed"] = num(order["_speed"])
+                    order["_needs_temper"] = "回火" in proc
+                    order["_needs_front"] = any(k in proc for k in ("正火", "淬火", "调质")) and not (proc.strip() == "回火返工")
+                    order["_loading"] = "间隔布料" if "间隔" in text(order["_loading"]) else "连续布料"
+                    order["_note"] = "" if cmap["loading"] else "未提供布料方式，默认连续"
+                    order["_source_file"] = file.name
+                    order["_source_sheet"] = sheet
+                    order["_source_row"] = ridx + 1
+                    order["_uid"] = f"{file.name}::{sheet}::{ridx+1}"
+                    errors = []
+                    for field in ("wall", "speed", "qty"):
+                        try:
+                            value = numeric_cell(r.get(cmap[field]), field)
+                            if value <= 0 or (field == "qty" and not value.is_integer()):
+                                raise ValueError(f"{field}必须为正数，支数必须为整数")
+                            order["_"+field] = int(value) if field == "qty" else value
+                        except ValueError as exc:
+                            order["_"+field] = None
+                            errors.append(str(exc))
+                    if proc == "调质":
+                        order["_needs_temper"] = True
+                    if not (order["_needs_front"] or order["_needs_temper"]):
+                        errors.append(f"未识别热处理路线:{proc}")
+                    for field, required in (("front", order["_needs_front"]), ("temper", order["_needs_temper"])):
+                        if required:
+                            try:
+                                value = numeric_cell(r.get(cmap[field]), field)
+                                if value <= 0:
+                                    raise ValueError(f"{field}温度必须为正数")
+                                order["_"+field] = value
+                            except ValueError as exc:
+                                order["_"+field] = None
+                                errors.append(str(exc))
+                    if cmap["plan_qty"] and not is_blank(r.get(cmap["plan_qty"])):
+                        try:
+                            order["_plan_tons"] = numeric_cell(r.get(cmap["plan_qty"]), "计划产量")
+                            if order["_plan_tons"] < 0:
+                                errors.append("计划产量不能为负数")
+                        except ValueError as exc:
+                            order["_plan_tons"] = 0
+                            errors.append(str(exc))
+                    if not contract:
+                        errors.append("缺少订单编号")
+                    order["_input_errors"] = errors
+                    missing = []
+                    for label, key in [("订单编号", "_contract"), ("热处理方式", "_process"), ("计划支数", "_qty"), ("步进周期", "_speed"), ("壁厚", "_wall")]:
+                        if is_blank(order.get(key)) or order.get(key) == 0:
+                            missing.append(label)
+                    if order["_needs_front"] and order["_front"] is None:
+                        missing.append("前炉温度")
+                    if order["_needs_temper"] and order["_temper"] is None:
+                        missing.append("回火温度")
+                    if missing and not order["_input_errors"]:
+                        order["_input_errors"].append(f"缺少:{','.join(missing)}")
+                    rows.append(order)
     if not rows:
         raise ValueError("没有读取到可排订单")
     return rows, source_headers
@@ -197,17 +263,17 @@ def special_tokens(rule_dir: Path) -> set[str]:
     """读取特殊钢级清单。"""
     out = set()
     for file in files_from(rule_dir):
-        xls = pd.ExcelFile(file)
-        for sheet in xls.sheet_names:
-            df = pd.read_excel(xls, sheet_name=sheet, header=None, dtype=object)
-            vals = [text(v) for v in df.to_numpy().ravel()]
-            if not any("特殊钢级" in v for v in vals):
-                continue
-            for v in vals:
-                for token in re.split(r"[、,，;；\s]+", v):
-                    t = token.strip("：:= ")
-                    if t and re.search(r"[A-Za-z0-9]", t) and "特殊" not in t and "其它" not in t:
-                        out.add(t.upper())
+        with pd.ExcelFile(file) as xls:
+            for sheet in xls.sheet_names:
+                df = pd.read_excel(xls, sheet_name=sheet, header=None, dtype=object)
+                if "特殊钢级清单" not in sheet:
+                    continue
+                for v in df.iloc[1:, 0]:
+                    t = norm(text(v)).upper()
+                    if re.fullmatch(r"[A-Z0-9]+(?:-[A-Z0-9]+)*", t):
+                        out.add(t)
+    if not out:
+        raise RuleError("未找到独立的特殊钢级清单，请使用现场确认版规则表")
     return out
 
 
@@ -216,38 +282,45 @@ def read_rules(rule_dir: Path) -> tuple[list[dict], int, int, set[str]]:
     rules, front_steps, temper_steps = [], None, None
     specials = special_tokens(rule_dir)
     for file in files_from(rule_dir):
-        xls = pd.ExcelFile(file)
-        for sheet in xls.sheet_names:
-            df = pd.read_excel(xls, sheet_name=sheet, header=None, dtype=object)
-            flat = " ".join(text(v) for v in df.to_numpy().ravel())
-            if "总料位" in flat and front_steps is None:
-                nums = [int(float(x)) for x in re.findall(r"\d+", flat)]
-                if 42 in nums and 70 in nums:
-                    front_steps, temper_steps = 42, 70
-            for i, row in df.iterrows():
-                vals = [text(v) for v in row.tolist()]
-                if not ("条件1" in vals and any("回火" in v and "空格" in v for v in vals)):
-                    continue
-                cols = {v: j for j, v in enumerate(vals)}
-                c1 = vals.index("条件1")
-                c2 = vals.index("条件2") if "条件2" in vals else c1 + 1
-                tb = next(j for j, v in enumerate(vals) if "回火" in v and "空格" in v)
-                fb = next(j for j, v in enumerate(vals) if ("正火" in v or "淬火" in v or "前炉" in v) and "空格" in v)
-                for _, r in df.iloc[i + 1:].iterrows():
-                    cond = text(r.iloc[c1])
-                    mat = text(r.iloc[c2])
-                    if not cond or "说明" in cond:
+        with pd.ExcelFile(file) as xls:
+            for sheet in xls.sheet_names:
+                df = pd.read_excel(xls, sheet_name=sheet, header=None, dtype=object)
+                flat = " ".join(text(v) for v in df.to_numpy().ravel())
+                for _, row in df.iterrows():
+                    vals = [text(v) for v in row.tolist()]
+                    if "总料位" in vals:
+                        j = vals.index("总料位")
+                        f, t = numeric_cell(row.iloc[j+1], "前炉料位"), numeric_cell(row.iloc[j+2], "回火料位")
+                        if min(f,t) <= 0 or not (f.is_integer() and t.is_integer()):
+                            raise RuleError("炉台料位必须为正整数")
+                        if front_steps is not None and (front_steps,temper_steps) != (int(f),int(t)):
+                            raise RuleError("规则文件中的炉台料位不一致")
+                        front_steps, temper_steps = int(f), int(t)
+                for i, row in df.iterrows():
+                    vals = [text(v) for v in row.tolist()]
+                    if not ("条件1" in vals and any("回火" in v and "空格" in v for v in vals)):
                         continue
-                    fblank, tblank = num(r.iloc[fb]), num(r.iloc[tb])
-                    if fblank is None and tblank is None:
-                        continue
-                    rules.append({
-                        "序号": len(rules) + 1,
-                        "条件1": cond,
-                        "条件2": mat,
-                        "前炉空格": float(fblank or 0),
-                        "回火空格": float(tblank or 0),
-                    })
+                    cols = {v: j for j, v in enumerate(vals)}
+                    c1 = vals.index("条件1")
+                    c2 = vals.index("条件2") if "条件2" in vals else c1 + 1
+                    tb = next(j for j, v in enumerate(vals) if "回火" in v and "空格" in v)
+                    fb = next(j for j, v in enumerate(vals) if ("正火" in v or "淬火" in v or "前炉" in v) and "空格" in v)
+                    for _, r in df.iloc[i + 1:].iterrows():
+                        cond = text(r.iloc[c1])
+                        mat = text(r.iloc[c2])
+                        if not cond or "说明" in cond:
+                            continue
+                        fblank, tblank = num(r.iloc[fb]), num(r.iloc[tb])
+                        if fblank is None and tblank is None:
+                            continue
+                        rules.append({
+                            "序号": len(rules) + 1,
+                            "条件1": cond,
+                            "条件2": mat,
+                            "前炉空格": fblank,
+                            "回火空格": tblank,
+                            "来源": f"{file.name}/{sheet}/行{int(r.name)+1}",
+                        })
     if not rules:
         raise ValueError("未读取到换规规则")
     if front_steps is None or temper_steps is None:
@@ -258,16 +331,16 @@ def read_rules(rule_dir: Path) -> tuple[list[dict], int, int, set[str]]:
 def atom_ok(atom: str, dt: float, dw: float) -> bool:
     """判断一个 ΔC/ΔT 条件是否成立。"""
     s = atom.replace(" ", "").replace("＜", "<").replace("≤", "<=").replace("≥", ">=").replace("ΔC", "C").replace("ΔT", "T")
-    chain = re.search(r"(-?\d+(?:\.\d+)?)(<=|<)(C|T)(<=|<)(-?\d+(?:\.\d+)?)", s)
+    chain = re.fullmatch(r"(-?\d+(?:\.\d+)?)(<=|<)(C|T)(<=|<)(-?\d+(?:\.\d+)?)", s)
     if chain:
         lo, lop, var, rop, hi = chain.groups()
         val = dt if var == "C" else dw
         left = float(lo) <= val if lop == "<=" else float(lo) < val
         right = val <= float(hi) if rop == "<=" else val < float(hi)
         return left and right
-    m = re.search(r"(C|T)(<=|>=|<|>|=)(-?\d+(?:\.\d+)?)", s)
+    m = re.fullmatch(r"(C|T)(<=|>=|<|>|=)(-?\d+(?:\.\d+)?)", s)
     if not m:
-        m = re.search(r"(-?\d+(?:\.\d+)?)(<=|>=|<|>|=)(C|T)", s)
+        m = re.fullmatch(r"(-?\d+(?:\.\d+)?)(<=|>=|<|>|=)(C|T)", s)
         if not m:
             return False
         n, op, var = float(m.group(1)), m.group(2), m.group(3)
@@ -279,10 +352,10 @@ def atom_ok(atom: str, dt: float, dw: float) -> bool:
 
 
 def condition_ok(cond: str, temp_diff: float, wall_diff: float) -> bool:
-    """按逗号/或为 OR、且为 AND 解析换规条件。"""
-    cond = cond.replace("并且", "且").replace("，", ",").replace("；", ",").replace("或", ",")
-    for alt in [x for x in cond.split(",") if x.strip()]:
-        atoms = [a for a in re.split(r"且|and", alt, flags=re.I) if a.strip()]
+    """只有显式的或/OR表示 OR；逗号、分号和且均表示 AND。"""
+    cond = cond.replace("并且", "且")
+    for alt in re.split(r"或|\bor\b", cond, flags=re.I):
+        atoms = [a for a in re.split(r"且|and|[,，;；]", alt, flags=re.I) if a.strip()]
         if atoms and all(atom_ok(a, temp_diff, wall_diff) for a in atoms):
             return True
     return False
@@ -292,7 +365,8 @@ def material_ok(rule_mat: str, nxt: dict, specials: set[str]) -> bool:
     """按后订单钢级判断条件2。"""
     mat = text(rule_mat)
     rear = f"{text(nxt.get('_steel'))} {text(nxt.get('_brand'))}".upper()
-    is_special = any(t and t in rear for t in specials)
+    tokens = set(re.findall(r"[A-Z0-9]+(?:-[A-Z0-9]+)*", rear))
+    is_special = bool(tokens & specials)
     if "其它" in mat:
         return not is_special
     if "特殊" in mat:
@@ -315,11 +389,21 @@ def blank_count(prev: dict | None, cur: dict, furnace: str, rules, specials) -> 
         temp_diff = abs(prev["_temper"] - cur["_temper"])
         key = "回火空格"
     wall_diff = abs(prev["_wall"] - cur["_wall"])
-    hits = [r for r in rules if material_ok(r["条件2"], cur, specials) and condition_ok(r["条件1"], temp_diff, wall_diff)]
+    rule_rows=tuple((r["序号"],r["条件1"],r["条件2"],r[key]) for r in rules)
+    rear=f"{text(cur.get('_steel'))} {text(cur.get('_brand'))}".upper()
+    value,number=_blank_lookup(rule_rows,tuple(sorted(specials)),rear,temp_diff,wall_diff,furnace)
+    return value, f"第{number}条，ΔC={temp_diff:g}℃，ΔT={wall_diff:g}"
+
+
+@lru_cache(maxsize=20000)
+def _blank_lookup(rule_rows, specials, rear, temp_diff, wall_diff, furnace):
+    hits=[(seq,value) for seq,cond,mat,value in rule_rows if material_ok(mat,{"_steel":rear,"_brand":""},set(specials)) and condition_ok(cond,temp_diff,wall_diff)]
     if not hits:
-        return 0, "未命中规则"
-    best = max(hits, key=lambda r: r[key])
-    return best[key], f"第{best['序号']}条，ΔC={temp_diff:g}℃，ΔT={wall_diff:g}"
+        raise RuleError(f"{furnace}未命中规则，ΔC={temp_diff:g}℃，ΔT={wall_diff:g}")
+    if any(value is None for _,value in hits):
+        raise RuleError(f"{furnace}命中规则的空格数缺失，需现场确认")
+    number,value=max(hits,key=lambda r:r[1])
+    return value,number
 
 
 def blank_text(value: float) -> str:
@@ -348,8 +432,15 @@ def edge_ok(state, cur, rules, specials) -> tuple[bool, str]:
     pf, pt = state.get("front"), state.get("temper")
     if cur["_needs_front"] and not cur["_needs_temper"] and pt is not None and state.get("front_inserted", 0) >= 1:
         return False, "两个回火订单之间已插入1单仅前炉订单，继续插入会造成回火炉空炉风险"
-    fb, fr = blank_count(pf, cur, "前炉", rules, specials) if cur["_needs_front"] else (0, "无")
-    tb, tr = blank_count(pt, cur, "回火炉", rules, specials) if cur["_needs_temper"] else (0, "无")
+    try:
+        fb, fr = blank_count(pf, cur, "前炉", rules, specials) if cur["_needs_front"] else (0, "无")
+        tb, tr = blank_count(pt, cur, "回火炉", rules, specials) if cur["_needs_temper"] else (0, "无")
+    except RuleError as exc:
+        return False, str(exc)
+    if pf and cur["_needs_front"] and abs(abs(cur["_front"]-pf["_front"])-60) < 1e-9:
+        material = set(re.findall(r"[A-Z0-9]+(?:-[A-Z0-9]+)*", f"{text(cur.get('_steel'))} {text(cur.get('_brand'))}".upper()))
+        if material & {"4140", "35CRMO", "42CRMO", "45", "45钢"}:
+            return False, "现场规则备注6:该钢级淬火温差60℃需空炉换规，空格折算尚未确认"
     front_cross = bool(pf and cur["_needs_front"] and abs(cur["_front"] - pf["_front"]) > TIGHT_TEMP)
     temper_rise_cross = bool(pt and cur["_needs_temper"] and cur["_temper"] > pt["_temper"] + TIGHT_TEMP)
     if fb > LIMIT_BLANKS and not front_cross:
@@ -367,7 +458,7 @@ def edge_ok(state, cur, rules, specials) -> tuple[bool, str]:
 
 def seed_order_with_ortools(items: list[dict]) -> list[dict]:
     """用 OR-Tools 生成回火升温初始序列。"""
-    if len(items) <= 2:
+    if len(items) <= 2 or pywrapcp is None:
         return sorted(items, key=lambda x: (x["_temper"] if x["_needs_temper"] else 9999, x["_front"] or 9999, x["_wall"]))
     manager = pywrapcp.RoutingIndexManager(len(items), 1, 0)
     routing = pywrapcp.RoutingModel(manager)
@@ -397,7 +488,7 @@ def seed_order_with_ortools(items: list[dict]) -> list[dict]:
 
 def build_sequence(items, rules, specials) -> tuple[list[dict], list[dict]]:
     """构造严格20格主序列，不能接续的下沉。"""
-    pool = seed_order_with_ortools(items)
+    pool = list(items)
     pool.sort(key=lambda x: (x["_temper"] if x["_needs_temper"] else 10_000, x["_front"] or 10_000, x["_wall"], x["_speed"]))
     main, deferred, state = [], [], {"front": None, "front_prev": None, "temper": None, "front_inserted": 0}
     while pool:
@@ -448,8 +539,11 @@ def insert_by_temperature(main, group):
     return main[:pos] + group + main[pos:]
 
 
-def restore_large_platforms(main, deferred):
+def restore_large_platforms(main, deferred, rules=None, specials=None):
     """把同温区累计产量达到阈值的订单恢复到正常生产段。"""
+    if rules is None or specials is None:
+        raise ValueError("大批量恢复必须传入实际规则，并校验候选")
+    from engine import sequence_problems
     groups = {}
     for x in deferred:
         key = platform_key(x)
@@ -461,11 +555,14 @@ def restore_large_platforms(main, deferred):
         if tons < MIN_PLATFORM_TONNAGE:
             continue
         arr.sort(key=lambda x: (x["_wall"], x["_speed"], x["_contract"]))
+        candidate = insert_by_temperature(main, arr)
+        if sequence_problems(candidate, rules, specials):
+            continue
         for x in arr:
             x["_platform_tons"] = tons
             x["_start_reason"] = f"同温区累计计划产量{tons:g}吨≥{MIN_PLATFORM_TONNAGE}吨，恢复到正常集中生产"
             restored.add(id(x))
-        main = insert_by_temperature(main, arr)
+        main = candidate
     return main, [x for x in deferred if id(x) not in restored]
 
 
@@ -621,6 +718,12 @@ def schedule_times(main, rules, specials, front_steps, temper_steps) -> list[dic
         if not x["_needs_front"] and x["_needs_temper"]:
             fs = None
         x.update({"_seq": i, "_gap": gap, "_front_start": fs, "_temper_start": ts, "_deferred": False})
+        # 在保持回火最早可行时间的前提下，将前炉首支推迟到及时供料。
+        if fs is not None and ts is not None:
+            fs = max(fs, ts - front_hold)
+            x["_front_start"] = fs
+        x["_front_hold"], x["_temper_hold"] = front_hold, temper_hold
+        x.pop("_defer_reason", None)
         if fs is not None:
             x["_front_last_in"] = fs + (qty - 1) * gap
             x["_front_end"] = x["_front_last_in"] + front_hold
@@ -658,26 +761,26 @@ def read_tooling(path: Path) -> tuple[list[dict], list[dict]]:
     """读取喷嘴和除鳞环规则。"""
     nozzles, descales = [], []
     for file in files_from(path):
-        xls = pd.ExcelFile(file)
-        for sheet in xls.sheet_names:
-            df = pd.read_excel(xls, sheet_name=sheet, header=None, dtype=object)
-            full = "\n".join(text(v) for v in df.to_numpy().ravel())
-            coef, offset = tooling_formula(full)
-            for i, row in df.iterrows():
-                vals = [text(v) for v in row.tolist()]
-                if "管坯外径 (mm)" in vals and "喷嘴内径 d (mm)" in vals:
-                    od, inn = vals.index("管坯外径 (mm)"), vals.index("管坯内径 (mm)")
-                    nz, cone = vals.index("喷嘴内径 d (mm)"), vals.index("分水锥直径 e (mm)")
-                    for _, r in df.iloc[i + 1:].iterrows():
-                        if parse_range(r.iloc[od]) and text(r.iloc[nz]):
-                            nozzles.append({
-                                "外径": parse_range(r.iloc[od]), "内径": parse_range(r.iloc[inn]),
-                                "喷嘴": text(r.iloc[nz]), "分水锥": text(r.iloc[cone]),
-                                "条件2系数": coef, "条件2扣减": offset,
-                            })
-            for m in re.finditer(r"(\d+)\.?\s*(\d+(?:\.\d+)?)\s*([≤＜<])\s*[φΦ]\s*([≤＜<])\s*(\d+(?:\.\d+)?)", full):
-                idx, lo, lop, hop, hi = m.groups()
-                descales.append({"规格": f"除鳞环{idx}（{lo}{lop}φ{hop}{hi}）", "下": float(lo), "上": float(hi), "左闭": lop == "≤", "右闭": hop == "≤"})
+        with pd.ExcelFile(file) as xls:
+            for sheet in xls.sheet_names:
+                df = pd.read_excel(xls, sheet_name=sheet, header=None, dtype=object)
+                full = "\n".join(text(v) for v in df.to_numpy().ravel())
+                coef, offset = tooling_formula(full)
+                for i, row in df.iterrows():
+                    vals = [text(v) for v in row.tolist()]
+                    if "管坯外径 (mm)" in vals and "喷嘴内径 d (mm)" in vals:
+                        od, inn = vals.index("管坯外径 (mm)"), vals.index("管坯内径 (mm)")
+                        nz, cone = vals.index("喷嘴内径 d (mm)"), vals.index("分水锥直径 e (mm)")
+                        for _, r in df.iloc[i + 1:].iterrows():
+                            if parse_range(r.iloc[od]) and text(r.iloc[nz]):
+                                nozzles.append({
+                                    "外径": parse_range(r.iloc[od]), "内径": parse_range(r.iloc[inn]),
+                                    "喷嘴": text(r.iloc[nz]), "分水锥": text(r.iloc[cone]),
+                                    "条件2系数": coef, "条件2扣减": offset,
+                                })
+                for m in re.finditer(r"(\d+)\.?\s*(\d+(?:\.\d+)?)\s*([≤＜<])\s*[φΦ]\s*([≤＜<])\s*(\d+(?:\.\d+)?)", full):
+                    idx, lo, lop, hop, hi = m.groups()
+                    descales.append({"规格": f"除鳞环{idx}（{lo}{lop}φ{hop}{hi}）", "下": float(lo), "上": float(hi), "左闭": lop == "≤", "右闭": hop == "≤"})
     return nozzles, descales
 
 
@@ -729,6 +832,7 @@ def nozzle_match(x, rules) -> tuple[str, str]:
 
     # 取增量最小的那个（即最接近且大于等于备用内径）
     diff, r = min(candidates, key=lambda x: x[0])
+    lo = r["外径"][0]
     reason = f"喷嘴条件2匹配：外径{outer:g}不在管坯外径范围（或内径不匹配），备用内径{spare_inner:.1f}，选用外径下限{lo:.1f}，增量{diff:.1f}"
     cone = f"（{r['分水锥']}）" if r.get("分水锥") and r["分水锥"] != "无分水锥" else "（无分水锥）"
     return f"{r['喷嘴']}{cone}", reason
@@ -760,7 +864,7 @@ def overview_row(x, seq=None, deferred=False):
     if deferred:
         reason = x.get("_defer_reason", "不能接入当前集中生产路径，暂缓/剔除主序列")
         return {
-            "序号": seq, "阶段": "暂缓/剔除主序列", "订单编号": x["_contract"], "主体厂": x.get("_factory", ""),
+            "序号": seq, "阶段": "暂缓/剔除主序列", "任务ID":order_id(x), "订单编号": x["_contract"], "主体厂": x.get("_factory", ""),
             "品种": x.get("_variety", ""), "外径": x["_outer"], "长度范围": x.get("_length", ""), "热处理方式": x["_process"],
             "计划产量": x.get("_plan_qty", ""), "牌号": x.get("_brand", ""), "钢级": x.get("_steel", ""), "壁厚": x["_wall"],
             "数量": x["_qty"], "步进周期": x["_speed"], "布料方式": x["_loading"], "前炉温度": x.get("_front", ""),
@@ -769,7 +873,7 @@ def overview_row(x, seq=None, deferred=False):
             "是否拥堵": "未排", "备注": append_note(x.get("_note", ""), reason), "急催": x.get("_urgent", ""), "急催备注": "",
         }
     return {
-        "序号": x["_seq"], "阶段": "正常生产", "订单编号": x["_contract"], "主体厂": x.get("_factory", ""),
+        "序号": x["_seq"], "阶段": "正常生产", "任务ID":order_id(x), "订单编号": x["_contract"], "主体厂": x.get("_factory", ""),
         "品种": x.get("_variety", ""), "外径": x["_outer"], "长度范围": x.get("_length", ""), "热处理方式": x["_process"],
         "计划产量": x.get("_plan_qty", ""), "牌号": x.get("_brand", ""), "钢级": x.get("_steel", ""), "壁厚": x["_wall"],
         "数量": x["_qty"], "步进周期": x["_speed"], "布料方式": x["_loading"], "前炉温度": x.get("_front", ""),
@@ -789,11 +893,11 @@ def pipe_rows(main):
             fr = tm = ""
             if x.get("_front_start") is not None:
                 a = x["_front_start"] + i * x["_gap"]
-                b = a + x["_speed"] * STEP_UNIT_MIN * FRONT_STEPS
+                b = a + x.get("_front_hold", x["_speed"] * STEP_UNIT_MIN * FRONT_STEPS)
                 fr = f"{clock(a)}-{clock(b)}"
             if x.get("_temper_start") is not None:
                 a = x["_temper_start"] + i * x["_gap"]
-                b = a + x["_speed"] * STEP_UNIT_MIN * TEMPER_STEPS
+                b = a + x.get("_temper_hold", x["_speed"] * STEP_UNIT_MIN * TEMPER_STEPS)
                 tm = f"{clock(a)}-{clock(b)}"
             rows.append({"排产序号": x["_seq"], "订单编号": x["_contract"], "钢管序号": i + 1, "前炉时段": fr, "回火时段": tm})
     return rows
@@ -835,12 +939,12 @@ def write_excel(path, main, deferred, source_headers):
         overview += [None, None, "以下订单与此次排程不能集中生产/排产"]
         overview += [overview_row(x, len(main) + i + 1, True) for i, x in enumerate(deferred)]
     write_sheet(wb, "排产总览", overview, BASE_COLS)
-    source_cols = ["排产序号", "阶段", "订单编号", "本单开始原因", "状态", "喷嘴规格", "除鳞环/挡水板规格"] + source_headers
+    source_cols = ["排产序号", "阶段", "任务ID", "订单编号", "本单开始原因", "状态", "喷嘴规格", "除鳞环/挡水板规格"] + source_headers
     source_rows = []
     for x in main + deferred:
         row = {
             "排产序号": x.get("_seq", ""), "阶段": "正常生产" if not x.get("_defer_reason") else "暂缓/剔除主序列",
-            "订单编号": x["_contract"], "本单开始原因": x.get("_start_reason", x.get("_defer_reason", "")),
+            "任务ID":order_id(x), "订单编号": x["_contract"], "本单开始原因": x.get("_defer_reason") or x.get("_start_reason", ""),
             "状态": x.get("_status", ""), "喷嘴规格": x.get("_nozzle", ""), "除鳞环/挡水板规格": x.get("_descale", ""),
         }
         row.update({h: x.get(h, "") for h in source_headers})
@@ -860,25 +964,18 @@ def main():
     p.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     args = p.parse_args()
 
-    global FRONT_STEPS, TEMPER_STEPS
-    orders, source_headers = read_inputs(args.input)
-    rules, FRONT_STEPS, TEMPER_STEPS, specials = read_rules(args.change_rules)
-    main_orders, deferred = build_sequence(orders, rules, specials)
-    main_orders, deferred = restore_large_platforms(main_orders, deferred)
-    main_orders, deferred = insert_front_order_near_temper_only(main_orders, deferred, rules, specials)
-    main_orders, deferred = defer_small_islands(main_orders, deferred, rules, specials)
-    main_orders = annotate_reasons(main_orders, rules, specials)
-    scheduled = schedule_times(main_orders, rules, specials, FRONT_STEPS, TEMPER_STEPS)
-    nozzles, descales = read_tooling(args.tooling_dir)
-    apply_tooling(scheduled + deferred, nozzles, descales)
-    write_excel(args.output, scheduled, deferred, source_headers)
+    from engine import Engine, Schedule
+    eng = Engine(args.input, args.change_rules, args.tooling_dir)
+    scheduled, deferred = eng.run({})
+    Schedule(eng, scheduled, deferred).export(args.output)
     print(f"排产完成：{args.output}")
     print(f"正常生产：{len(scheduled)}单；暂缓/剔除主序列：{len(deferred)}单；订单总数：{len(scheduled)+len(deferred)}")
     print(
-        f"前炉步数：{FRONT_STEPS}；回火炉步数：{TEMPER_STEPS}；严格空格上限：{LIMIT_BLANKS}；"
+        f"前炉步数：{eng.front_steps}；回火炉步数：{eng.temper_steps}；规则空格阈值：{LIMIT_BLANKS}；"
         f"同温区恢复阈值：{MIN_PLATFORM_TONNAGE}吨；小批温区剔除阈值：≤{SMALL_PLATFORM_MAX_ORDERS}单"
     )
 
 
 if __name__ == "__main__":
     main()
+

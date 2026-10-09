@@ -16,6 +16,8 @@ import os
 import socket
 import threading
 import time
+import uuid
+import re
 import urllib.error
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -27,10 +29,12 @@ from engine import Engine, diff_kpis
 from llm_config import API_KEY_ENV, MODEL as DEFAULT_MODEL
 
 MAX_LLM_ROUNDS = 6
+HISTORY = {}
+MAX_SESSIONS = 32
 ALLOWED_ACTIONS = {
     "kpi", "validate", "compare", "status", "list_orders", "explain",
     "move", "pin", "boost", "unboost", "temper_change", "delay",
-    "remove_orders", "restore_orders", "reset_changes", "export",
+    "remove_orders", "restore_orders", "reset_changes", "export", "undo", "unpin",
 }
 
 engine = Engine()
@@ -119,7 +123,7 @@ def summarize_offline(res) -> str:
     return out or "已执行,详见工具记录。"
 
 
-def run_turn(text: str) -> tuple[str, list]:
+def run_turn(text: str, session_id="default") -> tuple[str, list]:
     """执行一轮对话,返回 (助手文字, 工具步骤列表)。"""
     text = (text or "").strip()
     if not text:
@@ -127,10 +131,22 @@ def run_turn(text: str) -> tuple[str, list]:
     steps = []
 
     if API_KEY:
-        msgs = [{"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": text}]
+        if session_id not in HISTORY and len(HISTORY)>=MAX_SESSIONS:
+            HISTORY.pop(next(iter(HISTORY)))
+        prior=HISTORY.get(session_id,[])
+        with LOCK:
+            version=agent.version
+            context=json.dumps(agent.status(),ensure_ascii=False)
+        msgs=[{"role":"system","content":SYSTEM_PROMPT+"\n当前方案状态:"+context}]
+        for turn in prior:msgs.extend(turn)
+        current_start=len(msgs)
+        msgs.append({"role":"user","content":text})
+        deadline=time.monotonic()+120
         final = ""
         for _ in range(MAX_LLM_ROUNDS):
+            if time.monotonic()>deadline:
+                final="本轮达到时间上限，已成功的动作保留，详见工具记录。"
+                break
             try:
                 body = call_llm(msgs, wrap_tools(), API_KEY, MODEL)
             except urllib.error.HTTPError as e:
@@ -151,7 +167,7 @@ def run_turn(text: str) -> tuple[str, list]:
                 try:
                     kwargs = json.loads(fn.get("arguments") or "{}")
                 except Exception:  # noqa: BLE001
-                    kwargs = {}
+                    kwargs = None
                 with LOCK:
                     res = dispatch(agent, fn["name"], kwargs)
                 steps.append({"name": fn["name"], "args": kwargs, "result": res})
@@ -159,6 +175,11 @@ def run_turn(text: str) -> tuple[str, list]:
                              "content": json.dumps(res, ensure_ascii=False, default=_json_safe)})
         else:
             final = "已达到最大工具轮数,请查看工具执行记录。"
+        # 仅保存完整的消息交换，避免截断 tool_call/tool_result 配对。
+        if msgs and msgs[-1].get("role")=="assistant" and not msgs[-1].get("tool_calls"):
+            HISTORY[session_id]=(prior+[msgs[current_start:]])[-6:]
+        else:
+            HISTORY.pop(session_id,None)
         return final or "(无文字回复)", steps
 
     # 离线指令模式
@@ -179,6 +200,7 @@ def state_payload() -> dict:
         c = sum(1 for i in cur.issues if i.get("类别") == "必要换规")
         return {
             "mode": "LLM" if API_KEY else "离线指令",
+            "version":agent.version,"warnings":engine.warnings,"diagnostics":engine.diagnostics,
             "main": len(cur.main), "deferred": len(cur.deferred),
             "kpi": cur.kpi, "baseline_kpi": base.kpi,
             "diff": diff_kpis(base.kpi, cur.kpi),
@@ -245,11 +267,11 @@ class Handler(BaseHTTPRequestHandler):
             self._json(res)
             return
         if u.path == "/api/export":
-            path = OUT_DIR / f"热处理排程_网页版_{time.strftime('%Y%m%d_%H%M%S')}.xlsx"
+            path = OUT_DIR / f"热处理排程_网页版_{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}.xlsx"
             try:
                 with LOCK:
                     p = agent.current.export(path)
-                data = p.read_bytes()
+                    data = p.read_bytes()
             except Exception as e:  # noqa: BLE001
                 self._json({"error": str(e)}, 500)
                 return
@@ -266,39 +288,42 @@ class Handler(BaseHTTPRequestHandler):
 
     def _route_post(self):
         u = urlparse(self.path)
-        length = int(self.headers.get("Content-Length") or 0)
+        origin=self.headers.get("Origin")
+        if origin and urlparse(origin).netloc!=self.headers.get("Host"):
+            self._json({"error":"跨站修改请求已拒绝"},403);return
+        length=int(self.headers.get("Content-Length") or 0)
+        if length<0 or length>65536:
+            self._json({"error":"请求体超过限制"},413);return
         try:
-            payload = json.loads(self.rfile.read(length).decode("utf-8")) if length else {}
-        except Exception:  # noqa: BLE001
-            payload = {}
-        if u.path == "/api/chat":
-            if not TURN_LOCK.acquire(blocking=False):
-                self._json({"final": "⏳ 上一条请求还在处理中,请等它出结果后再发送。",
-                            "steps": [], "state": state_payload()})
-                return
-            try:
-                final, steps = run_turn(str(payload.get("text", "")))
-            finally:
-                TURN_LOCK.release()
-            self._json({"final": final, "steps": steps, "state": state_payload()})
-            return
-        if u.path == "/api/action":
-            name = str(payload.get("name", ""))
-            kwargs = payload.get("kwargs") or {}
-            if name not in ALLOWED_ACTIONS:
-                self._json({"error": f"未知动作:{name}"}, 400)
-                return
-            if not isinstance(kwargs, dict):
-                kwargs = {}
-            with LOCK:
-                res = dispatch(agent, name, kwargs)
-            self._json({"result": res, "state": state_payload()})
-            return
-        if u.path == "/api/reset":
-            with LOCK:
-                res = agent.reset()
-            self._json({"result": res, "state": state_payload()})
-            return
+            payload=json.loads(self.rfile.read(length).decode("utf-8")) if length else {}
+            if not isinstance(payload,dict):raise ValueError("需要JSON对象")
+        except Exception:
+            self._json({"error":"无效JSON，本次未执行"},400);return
+        if u.path not in {"/api/chat","/api/action","/api/reset"}:
+            self._json({"error":"not found"},404);return
+        if not TURN_LOCK.acquire(blocking=False):
+            self._json({"error":"另一个操作正在处理，请稍后重试"},409);return
+        try:
+            if "expected_version" in payload and payload["expected_version"]!=agent.version:
+                self._json({"error":"方案版本已变化，请刷新后重试","state":state_payload()},409);return
+            if u.path=="/api/chat":
+                session_id=self.headers.get("X-Session-ID","default")
+                if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}",session_id):
+                    self._json({"error":"无效会话ID"},400);return
+                final,steps=run_turn(str(payload.get("text","")),session_id)
+                self._json({"final":final,"steps":steps,"state":state_payload()});return
+            if u.path=="/api/reset":
+                with LOCK:res=dispatch(agent,"reset",{})
+                if "error" not in res:HISTORY.clear()
+            else:
+                name=payload.get("name","")
+                kwargs=payload.get("kwargs",{})
+                if name not in ALLOWED_ACTIONS:
+                    self._json({"error":"未知动作"},400);return
+                with LOCK:res=dispatch(agent,name,kwargs)
+            self._json({"result":res,"state":state_payload()},400 if "error" in res else 200)
+        finally:
+            TURN_LOCK.release()
         self._json({"error": "not found"}, 404)
 
     def log_message(self, fmt, *args):  # 静默访问日志
@@ -434,12 +459,15 @@ function addMsg(role, text, steps){
 }
 
 function renderState(s){
+  if (!s) return;
+  currentVersion=s.version;
   state = s;
   $('modeBadge').textContent = s.mode + '模式';
   $('modeBadge').className = 'badge' + (s.mode === 'LLM' ? ' llm' : '');
   $('modeHint').innerHTML = s.mode === 'LLM'
     ? '当前为大模型模式:直接说人话,智能体会自己调用排程工具并汇报结果。'
     : '当前为<strong>离线指令模式</strong>(未设置 DEEPSEEK_API_KEY)。可输入模板指令:KPI / 校验 / 对比 / 急催 / 解释 &lt;订单号&gt; / 把 &lt;订单号&gt; 提到最前 / 延迟 2 小时 / 撤销改动 / 导出。';
+  $('modeHint').innerHTML += '<br>' + (s.warnings || []).map(esc).join('<br>');
   const kpi = s.kpi, diff = s.diff || {};
   let html = '<tr><th>指标</th><th>当前</th><th>相对默认</th></tr>';
   for (const [k, v] of Object.entries(kpi)){
@@ -479,9 +507,9 @@ async function sendChat(text){
   addMsg('user', text);
   setBusy(true, '处理中…(大模型模式可能需几十秒)');
   try{
-    const r = await fetch('/api/chat', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({text})});
+    const r = await fetch('/api/chat', {method:'POST', headers:{'Content-Type':'application/json','X-Session-ID':sessionId}, body:JSON.stringify({text,expected_version:currentVersion})});
     const data = await r.json();
-    addMsg('bot', data.final, data.steps);
+    addMsg('bot', data.final || data.error || '操作未完成', data.steps || []);
     renderState(data.state);
   }catch(e){
     addMsg('bot', '⚠️ 请求失败:' + e, []);
@@ -497,23 +525,27 @@ $('btnExport').onclick = () => window.location.href = '/api/export';
 $('btnReset').onclick = async () => {
   setBusy(true, '重新加载数据并生成默认排程…');
   try{
-    const r = await fetch('/api/reset', {method:'POST'});
+    const r = await fetch('/api/reset', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({expected_version:currentVersion})});
     const data = await r.json();
-    addMsg('bot', data.result.说明 || '已重置', []);
+    addMsg('bot', data.error || (data.result && (data.result.error || data.result.说明)) || '操作未完成', []);
     renderState(data.state);
   }finally{ setBusy(false); }
 };
 $('btnOrders').onclick = $('orderFilter').onkeydown = async ev => {
-  if (ev && ev.key !== 'Enter') return;
+  if (ev && ev.type === 'keydown' && ev.key !== 'Enter') return;
+  if (ev && ev.type === 'keydown' && ev.key !== 'Enter') return;
   const f = $('orderFilter').value.trim();
   const r = await fetch('/api/orders?filter=' + encodeURIComponent(f));
   const data = await r.json();
   $('orderList').innerHTML = (data.订单 || []).map(o =>
-    '<div class="ord"><span class="id">' + esc(o.订单编号) + '</span> ' +
+    '<div class="ord"><span class="id">' + esc(o.订单编号) + '</span><br><small>任务ID: ' + esc(o.任务ID) + ' (' + esc(o.阶段) + ')</small><br>' +
     '<span class="meta">' + esc(o.主体厂) + ' | ' + esc(o.牌号) + ' | Φ' + esc(o.外径) + '×' + esc(o.壁厚) +
     ' | 前炉' + esc(o.前炉温度) + '℃/回火' + esc(o.回火温度) + '℃ | ' + esc(o.数量) + '支' +
     (o.急催 ? ' | 🔴急催' : '') + '</span></div>').join('') || '<div style="color:var(--muted)">无匹配(' + (data.命中 || 0) + ')</div>';
 };
+let currentVersion=null;
+const sessionId=sessionStorage.getItem('scheduleSession') || crypto.randomUUID();
+sessionStorage.setItem('scheduleSession',sessionId);
 const QUICK = ['现在排程整体情况怎么样','KPI','校验','对比','急催','撤销改动','列出订单'];
 $('quick').innerHTML = QUICK.map(q => '<span class="chip">' + q + '</span>').join('');
 document.querySelectorAll('#quick .chip').forEach(el => el.onclick = () => sendChat(el.textContent));
@@ -553,17 +585,20 @@ def main():
     ap.add_argument("--input", type=Path, default=None, help="订单数据目录(默认原脚本 data)")
     ap.add_argument("--rule", type=Path, default=None, help="换规规则目录(默认原脚本 rule)")
     ap.add_argument("--tooling", type=Path, default=None, help="工模具目录(默认原脚本工模具)")
+    ap.add_argument("--combine-inputs", action="store_true", help="明确合并多个批次文件")
     ap.add_argument("--out", type=Path, default=None, help="Excel 输出目录(默认 out/)")
     ap.add_argument("--model", default=DEFAULT_MODEL, help=f"模型名(默认取 llm_config.py:{DEFAULT_MODEL})")
     ap.add_argument("--no-llm", action="store_true", help="强制离线指令模式")
     args = ap.parse_args()
 
+    if args.host not in {"127.0.0.1","localhost"}:
+        raise SystemExit("本版本只支持本机工作台，请使用127.0.0.1")
     MODEL = args.model
     OUT_DIR = Path(args.out) if args.out else Path(__file__).resolve().parent / "out"
     OUT_DIR.mkdir(parents=True, exist_ok=True)
-    engine = Engine(args.input, args.rule, args.tooling)
+    engine = Engine(args.input, args.rule, args.tooling, args.combine_inputs)
     agent = SchedulerAgent(engine, OUT_DIR)
-    API_KEY = "" if args.no_llm else os.environ.get(API_KEY_ENV, "").strip()
+    API_KEY = "" if args.no_llm else (os.environ.get(API_KEY_ENV, "").strip() if API_KEY_ENV else "local")
 
     print("正在加载数据并生成默认排程 ...")
     agent.reset()
@@ -603,3 +638,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

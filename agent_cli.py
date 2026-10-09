@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import urllib.error
@@ -26,12 +27,13 @@ from llm_config import API_KEY_ENV, BASE_URL, MODEL as DEFAULT_MODEL
 SYSTEM_PROMPT = """你是某钢管厂630热处理产线的排程顾问智能体。你只能通过工具操作排程,绝不能自己心算顺序或时间。
 
 工作原则:
-1. 硬约束(相邻空格≤20格、回火温度回摆、前炉温度回摆)由排程引擎校验;每次改动后都要看返回结果里的"违规数",应尽量为0,不为0时向用户说明并建议撤销改动。
+1. 硬约束(相邻空格≤20格、回火温度回摆、前炉温度回摆)由排程引擎校验;候选必须满足硬约束才会提交。错误时原方案保留，不要声称动作成功。合法跨温区换规可以超过20格。
 2. 排程质量看KPI:相邻空格总数、超20格边数、暂缓单数、完工时间;对比"相对默认排程变化"。
-3. 不知道订单编号时先 list_orders;再用 move/pin/boost/temper_change/delay/remove_orders。
+3. 不知道任务时先 list_orders;合同号可能对应多任务，必须用工具返回的任务ID消歧，不要猜测。再用 move/pin/boost/temper_change/delay/remove_orders。
 4. 用户问"为什么这样排"用 explain。
 5. 用户要文件时用 export。
-6. 简体中文回答,简洁,引用工具返回的具体数字,不编造。"""
+6. 温度范围、实际设备容量和节拍联动没有确认时不要宣称方案可直接生产。
+7. 简体中文回答,简洁,引用工具返回的具体数字,不编造。"""
 
 HELP_TEXT = """离线模式指令示例(LLM 模式直接说人话即可):
   KPI / 指标              查看当前排程指标
@@ -48,6 +50,8 @@ HELP_TEXT = """离线模式指令示例(LLM 模式直接说人话即可):
   移除 <订单号>           完工/取消移出
   恢复订单 <订单号>
   撤销改动               回到默认排程
+  撤销上一步             撤销最近一次成功动作
+  解除锁定               解除人工位置约束
   对比                   当前 vs 默认 KPI
   导出                   输出 Excel
   重排 / 重置            重新读 Excel 重排
@@ -113,6 +117,12 @@ TOOL_SPECS = [
      "parameters": {"type": "object", "properties": {}, "required": []}},
 ]
 
+for spec in TOOL_SPECS:
+    spec["parameters"]["additionalProperties"] = False
+TOOL_SPECS[0]["parameters"]["properties"].update(offset={"type":"integer"},limit={"type":"integer"})
+for name,description in (("undo","撤销上一步成功改动"),("unpin","解除全部人工位置约束")):
+    TOOL_SPECS.append({"name":name,"description":description,"parameters":{"type":"object","properties":{},"required":[],"additionalProperties":False}})
+
 
 def wrap_tools():
     tools = []
@@ -126,96 +136,66 @@ def wrap_tools():
 
 def dispatch(agent, name, kwargs):
     try:
-        fn = getattr(agent, name)
-        return fn(**kwargs)
-    except Exception as e:  # noqa: BLE001
-        return {"error": f"工具 {name} 执行失败: {e}"}
+        specs={t["name"]:t for t in TOOL_SPECS}
+        if name not in specs:
+            raise ValueError("不允许的工具")
+        if not isinstance(kwargs,dict):
+            raise ValueError("工具参数必须为JSON对象")
+        schema=specs[name]["parameters"]
+        unknown=set(kwargs)-set(schema.get("properties",{}))
+        if unknown:raise ValueError("未知参数:"+",".join(sorted(unknown)))
+        missing=set(schema.get("required",[]))-set(kwargs)
+        if missing:raise ValueError("缺少参数:"+",".join(sorted(missing)))
+        for key,value in kwargs.items():
+            typ=schema["properties"][key]["type"]
+            valid={"string":isinstance(value,str),"number":isinstance(value,(int,float)) and not isinstance(value,bool) and math.isfinite(value),"integer":isinstance(value,int) and not isinstance(value,bool),"array":isinstance(value,list) and all(isinstance(v,str) for v in value)}.get(typ,False)
+            if not valid:raise ValueError(f"参数{key}类型不正确")
+        return getattr(agent,name)(**kwargs)
+    except Exception as e:
+        return {"error":f"工具{name}执行失败:{e}","版本":agent.version}
 
 
 def split_ids(s):
-    return [x for x in re.split(r"[\s,，、;；]+", s.strip()) if x]
+    return [x for x in re.split(r"[\s,，、;；]+",s.strip()) if x]
 
 
 def parse_offline(text):
-    """离线意图解析:始终返回 ((工具名, 参数), 提示);未识别时工具名为 None。"""
-    t = text.strip()
-    if not t:
-        return (None, {}), "请输入指令,输入'帮助'查看示例。"
-    if re.search(r"帮助|help|示例|怎么用", t, re.I):
-        return (None, {}), HELP_TEXT
-
-    m = re.search(r"导出|输出|存成|生成excel", t, re.I)
+    t=text.strip()
+    if not t:return (None,{}),"请输入指令。"
+    if re.search(r"不要|别(?:移|删|改|排)|取消(?:删除|移除|修改)",t):
+        return (None,{}),"识别到否定或取消操作，本次未执行。撤销上一步请使用‘撤销上一步’。"
+    if re.search(r"然后|接着|再导出|同时|之后",t):
+        return (None,{}),"离线模式一次只接受一条指令，请分开发送；本次未执行任何动作。"
+    literals={"帮助":None,"help":None,"示例":None,"怎么用":None,
+              "KPI":"kpi","kpi":"kpi","指标":"kpi","情况":"kpi",
+              "状态":"status","校验":"validate","违规":"validate","检查":"validate",
+              "对比":"compare","导出":"export","输出":"export","生成excel":"export",
+              "急催":"boost","加急":"boost","取消加急":"unboost","取消急催":"unboost",
+              "解除锁定":"unpin","撤销上一步":"undo","撤销改动":"reset_changes",
+              "恢复默认":"reset_changes","回到默认":"reset_changes","重置":"reset","重排":"reset"}
+    if t in literals:
+        tool=literals[t]
+        return (tool,{}),HELP_TEXT if tool is None else ""
+    if t in {"有哪些订单","列出","订单列表","所有订单"}:return ("list_orders",{"filter":""}),""
+    m=re.fullmatch(r"(?:查|查询|列出)\s+(.+)",t)
+    if m:return ("list_orders",{"filter":m.group(1)}),""
+    m=re.fullmatch(r"(?:解释|说明)\s+(.+)",t)
+    if m:return ("explain",{"contract":m.group(1)}),""
+    m=re.fullmatch(r"(?:把|将)?\s*(.+?)\s*(?:提到|移到|排到)\s*(最前|最后|末尾|第\s*\d+\s*位)",t)
     if m:
-        return ("export", {}), ""
-
-    m = re.search(r"(?:解释|说明|为什么)\s*([^\s,，。;；]+)", t)
-    if m:
-        return ("explain", {"contract": m.group(1)}), ""
-
-    m = re.search(r"(?:把|将)?\s*([^\s,，。]+?)\s*(?:提到|移到|提前到|排到|放在)\s*最前", t)
-    if m:
-        return ("move", {"contract": m.group(1), "position": "first"}), ""
-
-    m = re.search(r"(?:把|将)?\s*([^\s,，。]+?)\s*放在\s*([^\s,，。]+?)\s*前(?:面|边|头)?", t)
-    if m:
-        return ("move", {"contract": m.group(1), "position": f"before:{m.group(2)}"}), ""
-
-    m = re.search(r"(?:把|将)?\s*([^\s,，。]+?)\s*放在\s*([^\s,，。]+?)\s*后(?:面|边|头)?", t)
-    if m:
-        return ("move", {"contract": m.group(1), "position": f"after:{m.group(2)}"}), ""
-
-    m = re.search(r"(?:把|将)?\s*([^\s,，。]+?)\s*(?:提到|移到|排到)\s*第\s*(\d+)\s*位", t)
-    if m:
-        return ("move", {"contract": m.group(1), "position": m.group(2)}), ""
-
-    m = re.search(r"锁定\s*(.+)", t)
-    if m:
-        return ("pin", {"contracts": split_ids(m.group(1))}), ""
-
-    m = re.search(r"(?:取消|去掉|撤销)\s*(?:加急|急催|优先)", t)
-    if m:
-        return ("unboost", {}), ""
-
-    m = re.search(r"急催|紧急|加急|插单", t)
-    if m:
-        return ("boost", {}), ""
-
-    m = re.search(r"(?:延迟|检修|停机|顺延)\s*(\d+(?:\.\d+)?)\s*(小时|分钟|min|h)?", t)
-    if m:
-        mins = float(m.group(1)) * (60 if (m.group(2) or "") in {"小时", "h"} else 1)
-        return ("delay", {"minutes": mins}), ""
-
-    m = re.search(r"(?:把|将)?\s*([^\s,，。]+?)\s*的?回火温度(?:改|调|设为|变成|降到|升到)\s*(\d+)", t)
-    if m:
-        return ("temper_change", {"contract": m.group(1), "temper": int(m.group(2))}), ""
-
-    m = re.search(r"(?:移除|删除|去掉|完工|取消)\s*(.+)", t)
-    if m:
-        return ("remove_orders", {"contracts": split_ids(m.group(1))}), ""
-
-    if re.search(r"撤销|恢复默认|回到默认", t):
-        return ("reset_changes", {}), ""
-
-    m = re.search(r"恢复(?:订单|单)?\s*(.+)", t)
-    if m:
-        return ("restore_orders", {"contracts": split_ids(m.group(1))}), ""
-
-    if re.search(r"对比|前后", t):
-        return ("compare", {}), ""
-
-    if re.search(r"校验|违规|检查", t):
-        return ("validate", {}), ""
-
-    if re.search(r"有哪些|订单列表|列出|所有订单|查", t):
-        return ("list_orders", {"filter": ""}), ""
-
-    if re.search(r"kpi|指标|统计|情况|状态", t, re.I):
-        return ("kpi", {}), ""
-
-    if re.search(r"重排|重新排|重来|重置|恢复默认", t):
-        return ("reset", {}), ""
-
-    return (None, {}), "没听懂。输入'帮助'查看可用指令。"
+        target=m.group(2)
+        position="first" if target=="最前" else "last" if target in {"最后","末尾"} else re.search(r"\d+",target).group()
+        return ("move",{"contract":m.group(1).strip(),"position":position}),""
+    m=re.fullmatch(r"(?:把|将)?\s*(.+?)\s*放在\s*(.+?)\s*(前面|后面)",t)
+    if m:return ("move",{"contract":m.group(1).strip(),"position":("before:" if m.group(3)=="前面" else "after:")+m.group(2).strip()}),""
+    m=re.fullmatch(r"(?:改|修改)\s+(.+?)\s+回火温度\s+([+-]?\d+(?:\.\d+)?)",t)
+    if not m:m=re.fullmatch(r"(?:把|将)?\s*(.+?)\s*的?回火温度(?:改为|改|调为|设为|降到|升到)\s*([+-]?\d+(?:\.\d+)?)",t)
+    if m:return ("temper_change",{"contract":m.group(1).strip(),"temper":float(m.group(2))}),""
+    m=re.fullmatch(r"(?:延迟|顺延)\s*([+-]?\d+(?:\.\d+)?)\s*(小时|分钟|min|h)?",t)
+    if m:return ("delay",{"minutes":float(m.group(1))*(60 if m.group(2) in {"小时","h"} else 1)}),""
+    m=re.fullmatch(r"(锁定|移除|删除|恢复订单|加急|取消加急)\s+(.+)",t)
+    if m:return ({"锁定":"pin","移除":"remove_orders","删除":"remove_orders","恢复订单":"restore_orders","加急":"boost","取消加急":"unboost"}[m.group(1)],{"contracts":split_ids(m.group(2))}),""
+    return (None,{}),"未识别完整指令，本次未执行。输入‘帮助’查看模板。"
 
 
 def call_llm(messages, tools, api_key, model):
@@ -225,7 +205,7 @@ def call_llm(messages, tools, api_key, model):
         data=json.dumps(payload).encode("utf-8"),
         headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"},
     )
-    with urllib.request.urlopen(req, timeout=180) as resp:
+    with urllib.request.urlopen(req, timeout=45) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
 
@@ -296,7 +276,7 @@ def llm_chat(agent, api_key, model):
                 try:
                     kwargs = json.loads(fn.get("arguments") or "{}")
                 except Exception:  # noqa: BLE001
-                    kwargs = {}
+                    kwargs = None
                 print(f"  [工具] {fn['name']} {json.dumps(kwargs, ensure_ascii=False)}")
                 res = dispatch(agent, fn["name"], kwargs)
                 msgs.append({"role": "tool", "tool_call_id": tc["id"],
@@ -331,17 +311,18 @@ def main():
     ap.add_argument("--input", type=Path, default=None, help="订单数据目录,默认用原脚本 data 目录")
     ap.add_argument("--rule", type=Path, default=None, help="换规规则目录,默认用原脚本 rule 目录")
     ap.add_argument("--tooling", type=Path, default=None, help="工模具目录,默认用原脚本工模具目录")
+    ap.add_argument("--combine-inputs", action="store_true", help="明确合并多个排产文件")
     ap.add_argument("--out", type=Path, default=None, help="Excel 输出目录,默认本目录 out/")
     ap.add_argument("--model", default=DEFAULT_MODEL, help=f"模型名(默认取 llm_config.py:{DEFAULT_MODEL})")
     ap.add_argument("--no-llm", action="store_true", help="强制离线模式")
     args = ap.parse_args()
 
-    engine = Engine(args.input, args.rule, args.tooling)
+    engine = Engine(args.input, args.rule, args.tooling, args.combine_inputs)
     agent = SchedulerAgent(engine, args.out)
     print("正在加载数据并生成默认排程 ...")
     print(json.dumps(agent.reset(), ensure_ascii=False, indent=2))
 
-    api_key = os.environ.get(API_KEY_ENV, "").strip()
+    api_key = os.environ.get(API_KEY_ENV, "").strip() if API_KEY_ENV else "local"
     if api_key and not args.no_llm:
         print(f"\n[预检] 正在检查 LLM 接口连通性({BASE_URL}) ...")
         ok, diag = llm_preflight(api_key, args.model)
@@ -370,3 +351,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

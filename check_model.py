@@ -24,12 +24,12 @@ def main():
 
     print(f"接口地址: {BASE_URL}")
     print(f"检测模型: {args.model}")
-    key = os.environ.get(API_KEY_ENV, "").strip()
+    key = os.environ.get(API_KEY_ENV, "").strip() if API_KEY_ENV else "local"
     if not key:
         print(f"⚠ 未设置 {API_KEY_ENV} 环境变量,无法完成验证。")
         print("  请先设置:$env:DEEPSEEK_API_KEY = \"sk-...\"(换成你实际用的变量名)")
         raise SystemExit(2)
-    print("正在请求(1 token,不计成本)...")
+    print("正在发送最小连通性请求(是否计费以服务商为准)...")
     ok, diag = llm_preflight(key, args.model)
     if ok:
         print("✅ 预检通过:密钥与模型名均可用,重启 webui.py / agent_cli.py 即可。")
@@ -40,3 +40,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

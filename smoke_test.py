@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import argparse
+from pathlib import Path
 
 from actions import SchedulerAgent
 from agent_cli import dispatch, parse_offline
@@ -15,10 +17,13 @@ def show(label, res):
 
 
 def main():
-    engine = Engine()
+    ap=argparse.ArgumentParser()
+    ap.add_argument("--input",type=Path,default=Path(__file__).resolve().parent/"data"/"630厂热处理车间6月排产.xlsx")
+    args=ap.parse_args()
+    engine = Engine(args.input)
     agent = SchedulerAgent(engine)
     show("reset(基线排程)", agent.reset())
-    first = [x["_contract"] for x in agent.current.main[:3]]
+    first = [x["_uid"] for x in agent.current.main[:3]]
     print("\n基线前3单:", first)
     cmds = [
         "KPI",
@@ -43,21 +48,25 @@ def main():
         res = dispatch(agent, tool, kwargs)
         show(f"指令: {c} -> {tool} {json.dumps(kwargs, ensure_ascii=False)}", res)
         if tool == "move":
-            moved_head = agent.current.main[0]["_contract"]
+            moved_head = agent.current.main[0]["_uid"]
             print(">>> move 后首单:", moved_head)
+            if "error" in res:
+                raise SystemExit("FAIL: 移动候选失败:"+res["error"])
 
     # ---- 结果断言 ----
     print("\n===== 断言 =====")
     print("移动目标单:", first[1], "| move 后首单:", moved_head, "| 移动是否改变序列:", moved_head == first[1])
     if moved_head != first[1]:
         raise SystemExit("FAIL: move 未把订单移到最前")
-    from pathlib import Path
-    out = Path("out") / "热处理排程_智能体版.xlsx"
+    out = agent.out_dir / "热处理排程_智能体版.xlsx"
     print("导出文件存在:", out.exists(), out)
     if not out.exists():
         raise SystemExit("FAIL: 导出文件不存在")
+    assert agent.current.kpi["硬约束违规数"] == 0
+    assert len(agent.current.main)+len(agent.current.deferred) == len(engine.orders)
     print("全部断言通过")
 
 
 if __name__ == "__main__":
     main()
+
