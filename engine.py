@@ -2,19 +2,21 @@
 """确定性排程内核封装 —— 排程智能体第 1 层。
 
 设计原则:
-- 不改动原排程脚本 schedule_heat_treatment_strict_compact.py,直接以函数级 API 调用;
+- 使用随项目提供的排程脚本函数级 API，与规则读取修订保持一致;
 - 新增 validate(硬约束校验)与 kpis(排程质量指标);
 - 智能体只能通过这里暴露的动作改变排程,硬约束永远由原内核裁决。
 """
 from __future__ import annotations
 
 import importlib
+import copy
+import math
 import json
 import re
 import sys
 from pathlib import Path
 
-PROJECT = Path(r"C:\Users\mblon\Desktop\project")
+PROJECT = Path(__file__).resolve().parent
 CORE_MODULE = "schedule_heat_treatment_strict_compact"
 
 if str(PROJECT) not in sys.path:
@@ -129,7 +131,7 @@ def format_main_reason(x: dict, front_blank=None, temper_blank=None) -> tuple[st
 
 def format_defer_reason(x: dict) -> tuple[str, str]:
     """暂缓订单原因压缩为【暂缓】+一句短因(兼容全角冒号)。"""
-    s = core.text(x.get("_defer_reason", "")).replace(":", ":")
+    s = core.text(x.get("_defer_reason", "")).replace("：", ":")
     for prefix in ("不能接入当前集中生产路径:", "暂缓:"):
         if s.startswith(prefix):
             s = s[len(prefix):]
@@ -152,22 +154,25 @@ def _update_state(state: dict, x: dict) -> None:
         state["front_inserted"] = state.get("front_inserted", 0) + 1
 
 
-def build_sequence(orders, rules, specials, pinned=(), boosted=()):
+def build_sequence(orders, rules, specials, pinned=(), boosted=(), positions=None):
     """与原脚本一致的贪心构造,支持"锁定前缀"与"急催加权"。"""
     pinned = [core.norm(str(c)) for c in pinned]
     boosted = {core.norm(str(c)) for c in boosted}
-    pool = core.seed_order_with_ortools(orders)
+    # 原 OR 初排随后被全量排序覆盖；直接采用确定性排序，省去每次8秒搜索。
+    pool = list(orders)
     pool.sort(key=lambda x: (x["_temper"] if x["_needs_temper"] else 10_000,
                              x["_front"] or 10_000, x["_wall"], x["_speed"]))
     main, deferred = [], []
     state = {"front": None, "front_prev": None, "temper": None, "front_inserted": 0}
 
-    # 1) 锁定前缀:按给定顺序放置;即使违规也放置,违规由 validate 报告
+    # 1) 锁定前缀：约束不满足时拒绝候选。
     for c in pinned:
-        x = next((y for y in pool if core.norm(str(y["_contract"])) == c), None)
+        x = next((y for y in pool if core.order_id(y) == c), None)
         if x is None:
-            continue
+            raise ValueError(f"锁定任务不存在或输入待确认:{c}")
         ok, reason = core.edge_ok(state, x, rules, specials)
+        if not ok:
+            raise ValueError(f"锁定任务不可行:{c};{reason}")
         x["_start_reason"] = "人工锁定顺序,约束满足" if ok else f"人工锁定顺序,存在违规:{reason}"
         x["_pinned"] = True
         main.append(x)
@@ -176,8 +181,17 @@ def build_sequence(orders, rules, specials, pinned=(), boosted=()):
 
     # 2) 其余订单按原脚本规则贪心接续
     while pool:
+        positions = positions or {}
+        forced = [uid for uid, pos in positions.items() if pos == len(main)]
+        if len(forced) > 1:
+            raise ValueError("多个任务锁定到同一位置")
         candidates = []
         for x in pool:
+            uid = core.order_id(x)
+            if forced and uid != forced[0]:
+                continue
+            if uid in positions and positions[uid] != len(main):
+                continue
             ok, reason = core.edge_ok(state, x, rules, specials)
             if not ok:
                 continue
@@ -185,17 +199,19 @@ def build_sequence(orders, rules, specials, pinned=(), boosted=()):
             tb = core.blank_count(state.get("temper"), x, "回火炉", rules, specials)[0] if x["_needs_temper"] else 0
             t = x["_temper"] if x["_needs_temper"] else (state["temper"]["_temper"] if state.get("temper") else 9999)
             front_only = 1 if (x["_needs_front"] and not x["_needs_temper"]) else 0
-            boost = 0 if core.norm(str(x["_contract"])) in boosted else 1
+            boost = 0 if core.order_id(x) in boosted else 1
             candidates.append((boost, front_only, t, tb, fb,
                                abs((x.get("_front") or 0) - (state.get("front") or {}).get("_front", x.get("_front") or 0)),
                                x["_wall"], x, reason))
         if not candidates:
+            if any(core.order_id(x) in positions for x in pool):
+                raise ValueError("指定位置无法满足工艺约束或前置任务不足，原排程已保留")
             for x in pool:
                 ok, reason = core.edge_ok(state, x, rules, specials)
                 x["_defer_reason"] = f"不能接入当前集中生产路径:{reason}"
                 deferred.append(x)
             break
-        *_, chosen, reason = min(candidates, key=lambda v: v[:6])
+        *_, chosen, reason = min(candidates, key=lambda v: v[:7])
         chosen["_start_reason"] = reason
         main.append(chosen)
         pool.remove(chosen)
@@ -227,15 +243,38 @@ def validate(main, rules, specials, front_steps=None) -> list[dict]:
         if not ok:
             issues.append({"位置": i + 1, "订单编号": x["_contract"], "类别": "违规", "问题": reason})
         if i > 0:
-            mx, detail = core.edge_blank_summary(main[i - 1], x, rules, specials)
+            mx, detail = station_blanks(state, x, rules, specials)
             if mx > core.LIMIT_BLANKS and ok:
                 issues.append({"位置": i + 1, "订单编号": x["_contract"], "类别": "必要换规",
                                "问题": f"相邻空格{mx:g}格>20,属引擎允许的跨温区接续:{detail}"})
         w = transfer_wait_of(x, front_steps)
+        if w and w[0] < -1e-7:
+            issues.append({"位置":i+1,"订单编号":x["_contract"],"类别":"违规","问题":"回火首支早于前炉首支出炉"})
+        for name, needed, prev in (("front",x["_needs_front"],state.get("front")),("temper",x["_needs_temper"],state.get("temper"))):
+            if not needed:
+                continue
+            values = [x.get(f"_{name}_{key}") for key in ("start","last_in","end")]
+            if any(v is None or not isinstance(v,(int,float)) or not math.isfinite(v) or v < 0 for v in values):
+                issues.append({"位置":i+1,"订单编号":x["_contract"],"类别":"违规","问题":f"{name}时间缺失、非有限或负数"})
+                continue
+            if not values[0] <= values[1] <= values[2]:
+                issues.append({"位置":i+1,"订单编号":x["_contract"],"类别":"违规","问题":f"{name}首支、末支及出炉时序矛盾"})
+            gap=x.get("_gap")
+            if gap is not None and abs(values[1]-(values[0]+(x["_qty"]-1)*gap)) > 1e-7:
+                issues.append({"位置":i+1,"订单编号":x["_contract"],"类别":"违规","问题":f"{name}末支进炉与数量/节拍不一致"})
+            hold=x.get(f"_{name}_hold")
+            if hold is not None and abs(values[2]-values[1]-hold)>1e-7:
+                issues.append({"位置":i+1,"订单编号":x["_contract"],"类别":"违规","问题":f"{name}出炉与在炉时间不一致"})
+            if prev and prev.get(f"_{name}_last_in") is not None:
+                try:blanks=core.blank_count(prev,x,"前炉" if name=="front" else "回火炉",rules,specials)[0]
+                except core.RuleError:blanks=0
+                minimum=max(prev[f"_{name}_last_in"]+prev["_gap"],prev[f"_{name}_last_in"]+blanks*x["_speed"]*core.STEP_UNIT_MIN)
+                if values[0] < minimum-1e-7:
+                    issues.append({"位置":i+1,"订单编号":x["_contract"],"类别":"违规","问题":f"{name}进料时段或换规间隔冲突"})
         if w and w[0] > TRANSFER_WAIT_LIMIT_MIN:
             risks.append((w, i + 1, x))
         _update_state(state, x)
-    for w, i, x in sorted(risks, key=lambda t: -t[0][0])[:TRANSFER_RISK_TOP]:
+    for w, i, x in sorted(risks, key=lambda t: -t[0][0]):
         issues.append({"位置": i, "订单编号": x["_contract"], "类别": "堵炉风险",
                        "问题": f"前炉出炉后约等{float(w[0]):g}分钟({float(w[1]):g}步)才进回火炉,输送段滞留过长"})
     unique = []
@@ -247,12 +286,71 @@ def validate(main, rules, specials, front_steps=None) -> list[dict]:
     return unique
 
 
+def station_blanks(state, x, rules, specials):
+    values, details = [], []
+    for key, need, furnace in (("front","_needs_front","前炉"),("temper","_needs_temper","回火炉")):
+        if x[need] and state.get(key):
+            try:
+                n, detail = core.blank_count(state[key],x,furnace,rules,specials)
+                values.append(n); details.append(f"{furnace}{n:g}格({detail})")
+            except core.RuleError as exc:
+                details.append(str(exc))
+    return max(values,default=0),";".join(details)
+
+
+def sequence_problems(main, rules, specials, pinned=(), positions=None):
+    state={"front":None,"front_prev":None,"temper":None,"front_inserted":0}
+    problems=[]
+    ids=[core.order_id(x) for x in main]
+    if ids[:len(pinned)] != list(pinned):
+        problems.append("锁定前缀被后处理改变")
+    for uid,pos in (positions or {}).items():
+        if pos >= len(ids) or ids[pos] != uid:
+            problems.append(f"任务{uid}未保持第{pos+1}位")
+    for x in main:
+        ok,reason=core.edge_ok(state,x,rules,specials)
+        if not ok: problems.append(f"{core.order_id(x)}:{reason}")
+        _update_state(state,x)
+    return problems
+
+
+def recover_feasible_insertions(main, deferred, rules, specials, pinned=(), positions=None, max_checks=2000):
+    """有限搜索可行插入；保持任务身份、原序列相对顺序及人工约束。"""
+    checks=recovered=0
+    remaining=list(deferred)
+    changed=True
+    while changed and checks<max_checks:
+        changed=False
+        for x in list(remaining):
+            if x.get("_input_errors"):continue
+            # 先尝试原温区附近的位置，再按位置稳定排序，搜索上限与机器速度无关。
+            def distance(i):
+                neighbors=main[max(0,i-1):min(len(main),i+1)]
+                target=x["_temper"] if x["_needs_temper"] else x["_front"]
+                return min((abs(target-(n["_temper"] if x["_needs_temper"] and n["_needs_temper"] else n.get("_front") or target)) for n in neighbors),default=0),i
+            for i in sorted(range(len(pinned),len(main)+1),key=distance):
+                if checks>=max_checks:break
+                checks+=1
+                candidate=main[:i]+[x]+main[i:]
+                if sequence_problems(candidate,rules,specials,pinned,positions):continue
+                x.pop("_defer_reason",None)
+                x["_start_reason"]="可行插入恢复:完整序列和人工约束通过"
+                main=candidate;remaining.remove(x);recovered+=1;changed=True
+                break
+    return main,remaining,{"阶段":"有限可行插入","检查次数":checks,"检查上限":max_checks,"恢复任务数":recovered,"达到上限":checks>=max_checks}
+
+
 def kpis(main, deferred, rules, specials, front_steps=None) -> dict:
     """排程质量指标。"""
     blanks = []
-    for i in range(1, len(main)):
-        mx, _ = core.edge_blank_summary(main[i - 1], main[i], rules, specials)
-        blanks.append(mx)
+    state={"front":None,"front_prev":None,"temper":None,"front_inserted":0}
+    furnace_totals={"front":0,"temper":0}
+    for x in main:
+        mx, _ = station_blanks(state,x,rules,specials)
+        if state["front"] is not None or state["temper"] is not None: blanks.append(mx)
+        for key,need,furnace in (("front","_needs_front","前炉"),("temper","_needs_temper","回火炉")):
+            if x[need] and state.get(key): furnace_totals[key]+=core.blank_count(state[key],x,furnace,rules,specials)[0]
+        _update_state(state,x)
     issues = validate(main, rules, specials, front_steps)
     ends = [x.get(k) for x in main for k in ("_front_end", "_temper_end") if x.get(k) is not None]
     makespan = max(ends) if ends else 0.0
@@ -260,10 +358,15 @@ def kpis(main, deferred, rules, specials, front_steps=None) -> dict:
     return {
         "订单总数": len(main) + len(deferred),
         "正常生产单数": len(main),
+        "主序列喷嘴未匹配单数": sum(x.get("_nozzle") == "未匹配" for x in main),
+        "主序列除鳞环未匹配单数": sum(x.get("_descale") == "未匹配" for x in main),
+        "主序列工模具待确认单数": sum(x.get("_tooling_status") == "规格待确认" for x in main),
         "暂缓/剔除单数": len(deferred),
         "正常生产吨位": round(sum(float(x.get("_plan_tons", 0) or 0) for x in main), 1),
         "暂缓吨位": round(sum(float(x.get("_plan_tons", 0) or 0) for x in deferred), 1),
         "相邻空格总数": round(sum(blanks), 1),
+        "前炉换规空格总数": furnace_totals["front"],
+        "回火换规空格总数": furnace_totals["temper"],
         "平均相邻空格": round(sum(blanks) / len(blanks), 2) if blanks else 0.0,
         "超20格相邻边数": len([b for b in blanks if b > core.LIMIT_BLANKS]),
         "最大相邻空格": max(blanks) if blanks else 0.0,
@@ -294,7 +397,7 @@ def explain(main, deferred, contract) -> dict:
     """解释订单的排产原因、时间与工模具。"""
     n = core.norm(str(contract))
     for x in main:
-        if core.norm(str(x["_contract"])) == n:
+        if core.order_id(x) == n:
             return {
                 "订单编号": x["_contract"], "阶段": "正常生产", "序号": x.get("_seq"),
                 "主体厂": core.text(x.get("_factory")), "品种": core.text(x.get("_variety")),
@@ -307,14 +410,17 @@ def explain(main, deferred, contract) -> dict:
                 "前炉首支进炉": core.clock(x.get("_front_start")),
                 "回火首支进炉": core.clock(x.get("_temper_start")),
                 "喷嘴规格": core.text(x.get("_nozzle")), "除鳞环/挡水板规格": core.text(x.get("_descale")),
+                "工模具核对状态": x.get("_tooling_status"), "工模具匹配依据": x.get("_tooling_reason"),
                 "急催": core.text(x.get("_urgent")), "备注": core.text(x.get("_note")),
             }
     for x in deferred:
-        if core.norm(str(x["_contract"])) == n:
+        if core.order_id(x) == n:
             return {"订单编号": x["_contract"], "阶段": "暂缓/剔除主序列",
                     "原因": core.text(x.get("_defer_reason", "不能接入当前集中生产路径")),
                     "前炉温度": x.get("_front"), "回火温度": x.get("_temper"),
                     "壁厚": x.get("_wall"), "数量": x.get("_qty"), "计划产量": x.get("_plan_tons"),
+                    "喷嘴规格": x.get("_nozzle"), "除鳞环规格": x.get("_descale"),
+                    "工模具核对状态": x.get("_tooling_status"), "工模具匹配依据": x.get("_tooling_reason"),
                     "急催": core.text(x.get("_urgent")), "备注": core.text(x.get("_note"))}
     return {"error": f"未找到订单:{contract}"}
 
@@ -417,8 +523,14 @@ class Schedule:
         self.main, self.deferred = main, deferred
         self.kpi = kpis(main, deferred, engine.rules, engine.specials, engine.front_steps)
         self.issues = validate(main, engine.rules, engine.specials, engine.front_steps)
+        self.tooling_issues = [{"类别": "工模具待确认", "任务ID": core.order_id(x), "订单编号": x["_contract"],
+                               "阶段": "主序列" if group is main else "暂缓", "问题": x.get("_tooling_reason", "")}
+                              for group in (main, deferred) for x in group if x.get("_tooling_status") == "规格待确认"]
+        self.issues.extend(self.tooling_issues)
 
     def export(self, path: Path) -> Path:
+        if any(i["类别"] == "违规" for i in validate(self.main,self.engine.rules,self.engine.specials,self.engine.front_steps)):
+            raise ValueError("含硬约束违规的方案不能正式导出")
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         core.write_excel(path, self.main, self.deferred, self.engine.source_headers)
@@ -429,18 +541,25 @@ class Schedule:
 class Engine:
     """读取数据/规则/工模具,运行整条排程管线,支持改动重排。"""
 
-    def __init__(self, input_dir=None, rule_dir=None, tooling_dir=None):
+    def __init__(self, input_dir=None, rule_dir=None, tooling_dir=None, combine_inputs=False):
         self.input_dir = Path(input_dir) if input_dir else core.DEFAULT_INPUT
         self.rule_dir = Path(rule_dir) if rule_dir else core.DEFAULT_RULE
         self.tooling_dir = Path(tooling_dir) if tooling_dir else core.DEFAULT_TOOLING
         self.loaded = False
+        self.combine_inputs = combine_inputs
+        self.diagnostics = []
+        self.warnings = []
 
     def load(self) -> int:
+        if len(core.files_from(self.input_dir)) > 1 and not self.combine_inputs:
+            raise ValueError("目录含多个排产批次，请用 --input 指定单个Excel；明确合并时加 --combine-inputs")
         self.orders, self.source_headers = core.read_inputs(self.input_dir)
         self.rules, self.front_steps, self.temper_steps, self.specials = core.read_rules(self.rule_dir)
-        core.FRONT_STEPS, core.TEMPER_STEPS = self.front_steps, self.temper_steps
         self.nozzles, self.descales = core.read_tooling(self.tooling_dir)
         self.loaded = True
+        self.warnings = [] if self.nozzles and self.descales else ["未提供完整工模具规则，喷嘴/除鳞环可能未匹配"]
+        self.warnings.append("工模具规格匹配不代表库存可用；条件2档位及喷嘴选择待现场确认，未匹配明细见校验。当前文件不含挡水板及按工序适用规则。")
+        self.warnings.append("时间轴沿用订单级节拍模型；全炉节拍联动、升降温曲线及输送容量未提供，需现场核验")
         return len(self.orders)
 
     def run(self, overrides=None) -> tuple[list, list]:
@@ -448,26 +567,58 @@ class Engine:
         if not self.loaded:
             self.load()
         o = overrides or {}
-        orders = [dict(x) for x in self.orders]
+        allowed={"remove_contracts","temper_map","pinned","boost_contracts","positions","start_delay_minutes"}
+        if not isinstance(o,dict) or set(o)-allowed:raise ValueError("未知排程改动字段")
+        known={core.order_id(x) for x in self.orders}
+        referenced=set(o.get("remove_contracts",[]))|set(o.get("temper_map",{}))|set(o.get("pinned",[]))|set(o.get("boost_contracts",[]))|set(o.get("positions",{}))
+        if referenced-known:raise ValueError("改动包含未知任务ID")
+        for uid,pos in o.get("positions",{}).items():
+            if not isinstance(pos,int) or isinstance(pos,bool) or pos<0:raise ValueError("位置必须为非负整数")
+        delay=o.get("start_delay_minutes",0)
+        if isinstance(delay,bool) or not isinstance(delay,(int,float)) or not math.isfinite(delay) or delay<0:raise ValueError("开工延迟必须为非负有限数")
+        for t in o.get("temper_map",{}).values():
+            if isinstance(t,bool) or not isinstance(t,(int,float)) or not math.isfinite(t) or t<=0:raise ValueError("回火温度必须为正有限数")
+        orders = copy.deepcopy(self.orders)
+        self.diagnostics = []
 
         remove = {core.norm(str(c)) for c in o.get("remove_contracts", [])}
         if remove:
-            orders = [x for x in orders if core.norm(str(x["_contract"])) not in remove]
+            orders = [x for x in orders if core.order_id(x) not in remove]
 
         temper_map = {core.norm(str(c)): float(t) for c, t in (o.get("temper_map") or {}).items()}
         for x in orders:
-            t = temper_map.get(core.norm(str(x["_contract"])))
+            t = temper_map.get(core.order_id(x))
             if t is not None:
                 x["_temper"] = t
-                x["_needs_temper"] = True
-                if "回火" not in str(x.get("_process", "")):
-                    x["_process"] = f"{core.text(x.get('_process'))} + 回火(智能体调整)"
+                if not x["_needs_temper"]:
+                    raise ValueError("修改温度不能自动新增回火工序")
+                x["_input_errors"]=[e for e in x.get("_input_errors",[]) if not e.startswith("temper")]
 
-        main, deferred = build_sequence(orders, self.rules, self.specials,
-                                        pinned=o.get("pinned", []), boosted=o.get("boost_contracts", []))
-        main, deferred = core.restore_large_platforms(main, deferred)
-        main, deferred = core.insert_front_order_near_temper_only(main, deferred, self.rules, self.specials)
-        main, deferred = core.defer_small_islands(main, deferred, self.rules, self.specials)
+        waiting = [x for x in orders if x.get("_input_errors")]
+        eligible = [x for x in orders if not x.get("_input_errors")]
+        for x in waiting: x["_defer_reason"]="输入待确认:"+";".join(x["_input_errors"])
+        main, deferred = build_sequence(eligible, self.rules, self.specials,
+                                        pinned=o.get("pinned", []), boosted=o.get("boost_contracts", []),positions=o.get("positions",{}))
+        # 每个后处理阶段只提交通过全序列约束及人工约束的候选。
+        for name,fn in (("大批量恢复",lambda a,b:core.restore_large_platforms(a,b,self.rules,self.specials)),
+                        ("补前炉",lambda a,b:core.insert_front_order_near_temper_only(a,b,self.rules,self.specials))):
+            a,b=fn(copy.deepcopy(main),copy.deepcopy(deferred))
+            problems=sequence_problems(a,self.rules,self.specials,o.get("pinned",[]),o.get("positions",{}))
+            if problems:self.diagnostics.append({"阶段":name,"结果":"候选未采用","原因":problems})
+            else:main,deferred=a,b
+        main,deferred,record=recover_feasible_insertions(main,deferred,self.rules,self.specials,o.get("pinned",[]),o.get("positions",{}))
+        self.diagnostics.append(record)
+        a,b=core.defer_small_islands(copy.deepcopy(main),copy.deepcopy(deferred),self.rules,self.specials)
+        problems=sequence_problems(a,self.rules,self.specials,o.get("pinned",[]),o.get("positions",{}))
+        if problems:self.diagnostics.append({"阶段":"暂缓小批","结果":"候选未采用","原因":problems})
+        else:main,deferred=a,b
+        deferred += waiting
+        problems=sequence_problems(main,self.rules,self.specials,o.get("pinned",[]),o.get("positions",{}))
+        if problems:raise ValueError("最终序列不可行:"+";".join(problems))
+        expected=sorted(core.order_id(x) for x in orders)
+        actual=sorted(core.order_id(x) for x in main+deferred)
+        if actual != expected or len(actual) != len(set(actual)):
+            raise ValueError("排程后任务遗漏或重复")
         main = core.annotate_reasons(main, self.rules, self.specials)
         for x in main:
             if x.get("_pinned"):
@@ -533,3 +684,4 @@ if __name__ == "__main__":
     print("违规:", json.dumps(sched.issues, ensure_ascii=False, indent=2))
     p = sched.export(Path(__file__).resolve().parent / "out" / "热处理排程_默认基准.xlsx")
     print("已导出:", p)
+

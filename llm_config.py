@@ -22,9 +22,10 @@
    DeepSeek/Kimi/通义/智谱的对话模型均支持,Ollama 建议用 qwen2.5、llama3.1 及以上。
 2. 改完本文件后重启 python webui.py / python agent_cli.py 生效。
 3. 不确定模型名是否正确时,先跑 python check_model.py 一键自检(或直接看启动预检);
-   模型名填错时 API 会返回 400 并提示,不会产生费用。
+   预检会发出最小请求；是否计费以服务商为准。
 """
 
 BASE_URL = "https://api.deepseek.com/chat/completions"
 MODEL = "deepseek-flash"
 API_KEY_ENV = "DEEPSEEK_API_KEY"   # 密钥从哪个环境变量读取;本地模型(如 Ollama)可设为 ""
+
